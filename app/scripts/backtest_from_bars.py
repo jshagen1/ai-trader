@@ -1,6 +1,7 @@
 from pathlib import Path
 from types import SimpleNamespace
 import pandas as pd
+import math
 from sqlalchemy import create_engine
 
 from app.decision_engine import DecisionEngine
@@ -11,6 +12,28 @@ DB_FILE = ROOT / "trades.db"
 
 POINT_VALUE = 50.0
 MAX_LOOKAHEAD_BARS = 20
+
+def get_time_bucket(minutes):
+    try:
+        minutes = float(minutes)
+    except (TypeError, ValueError):
+        return "INVALID"
+
+    if math.isnan(minutes):
+        return "INVALID"
+
+    minutes = int(minutes)
+
+    if minutes < 30:
+        return "0-30"
+    if minutes < 60:
+        return "30-60"
+    if minutes < 120:
+        return "60-120"
+    if minutes <= 180:
+        return "120-180"
+
+    return "180+"
 
 
 def to_market_state(row):
@@ -135,6 +158,13 @@ def analyze_results(trades):
     print("\nBy Strategy")
     print("-----------")
     print(df.groupby("strategy")["pnl"].agg(["count", "sum", "mean", "min", "max"]))
+    
+    print("\nBy Time Bucket")
+    print("--------------")
+    print(
+        df.groupby("time_bucket")["pnl"]
+        .agg(["count", "sum", "mean", "min", "max"])
+    )
 
     out = ROOT / "backtest_results.csv"
     df.to_csv(out, index=False)
@@ -159,6 +189,8 @@ def main():
         "vwap", "atr", "rsi", "orb_high", "orb_low",
         "trend_score", "chop_score",
     ]).reset_index(drop=True)
+    
+    bars = bars.dropna(subset=["minutes_after_open"]).reset_index(drop=True)
 
     print(f"Loaded {len(bars)} bars")
     print("Starting backtest...")
@@ -200,6 +232,8 @@ def main():
             "exit_reason": exit_reason,
             "quantity": quantity,
             "pnl": pnl,
+            "minutes_after_open": market.minutes_after_open,
+            "time_bucket": get_time_bucket(getattr(market, "minutes_after_open", None)),
             "reason": signal.reason,
         }
 

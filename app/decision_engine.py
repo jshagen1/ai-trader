@@ -1,6 +1,7 @@
 from pathlib import Path
 import pandas as pd
 import joblib
+import math
 
 from app.models.trade_signal import TradeSignal
 from app.machine_learning.features import build_features
@@ -13,15 +14,27 @@ class DecisionEngine:
 
     def decide(self, market, recent_bars=None) -> TradeSignal:
         recent_bars = recent_bars or []
+        
+        # Handle NaN values in minutes_after_open
+        raw_minutes = getattr(market, "minutes_after_open", 999)
+        try:
+            minutes_after_open = float(raw_minutes)
+        except (TypeError, ValueError):
+            return self.hold("TIME_FILTER", "Invalid minutes after open")
+
+        if math.isnan(minutes_after_open):
+            return self.hold("TIME_FILTER", "Invalid minutes after open")
+
+        minutes_after_open = int(minutes_after_open)
 
         if market.position != "flat":
             return self.hold("POSITION_FILTER", "Already in position")
-
-        if market.minutes_after_open < 15:
-            return self.hold("TIME_FILTER", "Avoiding first 15 minutes")
-
-        if market.minutes_after_open > 180:
-            return self.hold("TIME_FILTER", "Avoiding late-session chop")
+        
+        if 30 <= minutes_after_open < 60:
+            return self.hold(
+                "TIME_FILTER",
+                f"Blocked weak opening window: {minutes_after_open}"
+            )
 
         if market.chop_score >= 0.55:
             return self.hold("CHOP_FILTER", f"Chop too high: {market.chop_score:.2f}")
