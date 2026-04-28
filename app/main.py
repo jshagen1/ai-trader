@@ -1,8 +1,10 @@
 import pandas as pd
 from fastapi import FastAPI
+from app.constants import POINT_VALUE
 from app.models.market_state import MarketState
 from app.models.trade_signal import TradeSignal
 from app.decision_engine import DecisionEngine
+from app.slippage import trade_slippage_points_and_dollars
 from app.db.database import Base
 from app.db.database import engine
 from app.db.database import SessionLocal
@@ -30,6 +32,24 @@ def health():
 def log_trade(data: dict):
     db = SessionLocal()
 
+    quantity = data.get("quantity") or 1
+    signal_entry = data.get("signal_entry", data.get("entry_price"))
+    slipped_entry = data.get("slipped_entry", data.get("entry_price"))
+    exit_price = data.get("exit_price")
+    slipped_exit = data.get("slipped_exit", data.get("exit_price"))
+
+    if None in (signal_entry, slipped_entry, exit_price, slipped_exit):
+        slippage_points, slippage_dollars = 0.0, 0.0
+    else:
+        slippage_points, slippage_dollars = trade_slippage_points_and_dollars(
+            float(signal_entry),
+            float(slipped_entry),
+            float(exit_price),
+            float(slipped_exit),
+            int(quantity),
+            POINT_VALUE,
+        )
+
     trade = CompletedTrade(
         timestamp=data.get("timestamp"),
         symbol=data.get("symbol"),
@@ -37,7 +57,9 @@ def log_trade(data: dict):
         entry_price=data.get("entry_price"),
         exit_price=data.get("exit_price"),
         pnl=data.get("pnl"),
-        quantity=data.get("quantity"),
+        quantity=quantity,
+        slippage_points=slippage_points,
+        slippage_dollars=slippage_dollars,
     )
 
     db.add(trade)

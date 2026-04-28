@@ -49,6 +49,9 @@ class CompletedTrade(Base):
     exit_price = Column(Float)
     pnl = Column(Float)
     quantity = Column(Integer)
+
+    slippage_points = Column(Float, nullable=True)
+    slippage_dollars = Column(Float, nullable=True)
     
 class MarketBar(Base):
     __tablename__ = "market_bars"

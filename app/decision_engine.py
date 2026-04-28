@@ -57,6 +57,12 @@ class DecisionEngine:
         return self.orb_breakout(market)
 
     def orb_breakout(self, m) -> TradeSignal:
+
+        LONG_SCORE_THRESHOLD = 0.70
+        LONG_ML_THRESHOLD = 0.55
+        SHORT_SCORE_THRESHOLD = 0.70
+        SHORT_ML_THRESHOLD = 0.45
+
         risk = m.atr * 1.25
         
         quantity = self.calculate_quantity(risk)
@@ -113,7 +119,7 @@ class DecisionEngine:
         if m.minutes_after_open >= 15:
             short_score += 0.05
 
-        if long_score >= 0.70 and ml_prob >= 0.55:
+        if long_score >= LONG_SCORE_THRESHOLD and ml_prob >= LONG_ML_THRESHOLD:
             return TradeSignal(
                 action="BUY",
                 strategy="ORB_BREAKOUT",
@@ -125,7 +131,7 @@ class DecisionEngine:
                 reason=f"ORB long score {long_score:.2f}, ML probability {ml_prob:.2f}, qty {quantity}",
             )
 
-        if short_score >= 0.70 and ml_prob <= 0.45:
+        if short_score >= SHORT_SCORE_THRESHOLD and ml_prob <= SHORT_ML_THRESHOLD:
             return TradeSignal(
                 action="SELL",
                 strategy="ORB_BREAKOUT",

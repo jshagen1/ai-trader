@@ -1,19 +1,23 @@
 from pathlib import Path
 from types import SimpleNamespace
-import pandas as pd
 import math
+
+import pandas as pd
 from sqlalchemy import create_engine
 
+from app.constants import POINT_VALUE
 from app.decision_engine import DecisionEngine
+from app.slippage import trade_slippage_points_and_dollars
 
 
 ROOT = Path(__file__).resolve().parents[2]
 DB_FILE = ROOT / "trades.db"
 
-POINT_VALUE = 50.0
 MAX_LOOKAHEAD_BARS = 20
 
-import math
+SLIPPAGE_TICKS = 1
+TICK_SIZE = 0.25
+SLIPPAGE_POINTS = SLIPPAGE_TICKS * TICK_SIZE
 
 def get_time_bucket(minutes):
     try:
@@ -51,6 +55,21 @@ def get_time_bucket(minutes):
         return "300-390"
 
     return "390+"
+
+def apply_entry_slippage(action, entry):
+    if action == "BUY":
+        return entry + SLIPPAGE_POINTS
+    if action == "SELL":
+        return entry - SLIPPAGE_POINTS
+    return entry
+
+
+def apply_exit_slippage(action, exit_price):
+    if action == "BUY":
+        return exit_price - SLIPPAGE_POINTS
+    if action == "SELL":
+        return exit_price + SLIPPAGE_POINTS
+    return exit_price
 
 
 def to_market_state(row):
@@ -159,6 +178,10 @@ def analyze_results(trades):
         print(f"Trades: {len(df_without_top2)}")
         print(f"Net PnL: ${df_without_top2['pnl'].sum():.2f}")
         print(f"Profit Factor: {profit_factor_top2:.2f}")
+        
+        if "slippage_dollars" in df_without_top2.columns:
+            print(f"Slippage: ${df_without_top2['slippage_dollars'].sum():.2f}")
+
     else:
         print("Not enough trades to remove top 2 largest winners.")
 
@@ -193,6 +216,16 @@ def analyze_results(trades):
     print(f"Expectancy: ${expectancy:.2f}")
     print(f"Profit Factor: {profit_factor:.2f}")
     print(f"Max Drawdown: ${df['drawdown'].min():.2f}")
+    
+    if "slippage_dollars" in df.columns:
+        print("\nSlippage Summary")
+        print("----------------")
+        print("Avg slippage per trade:", df["slippage_dollars"].mean())
+        print("Total slippage:", df["slippage_dollars"].sum())
+
+        print("\nSlippage by Time Bucket")
+        print("----------------------")
+        print(df.groupby("time_bucket")["slippage_dollars"].mean())
 
     print("\nBy Strategy")
     print("-----------")
@@ -255,7 +288,20 @@ def main():
         quantity = getattr(signal, "quantity", 1) or 1
 
         exit_price, exit_reason, exit_time = simulate_exit(bars, i, signal)
-        pnl = calculate_pnl(signal.action, signal.entry, exit_price, quantity)
+        
+        slipped_entry = apply_entry_slippage(signal.action, signal.entry)
+        slipped_exit = apply_exit_slippage(signal.action, exit_price)
+
+        pnl = calculate_pnl(signal.action, slipped_entry, slipped_exit, quantity)
+
+        slippage_points, slippage_dollars = trade_slippage_points_and_dollars(
+            signal.entry,
+            slipped_entry,
+            exit_price,
+            slipped_exit,
+            quantity,
+            POINT_VALUE,
+        )
 
         trade = {
             "entry_time": market.timestamp,
@@ -271,6 +317,10 @@ def main():
             "exit_reason": exit_reason,
             "quantity": quantity,
             "pnl": pnl,
+            "slipped_entry": slipped_entry,
+            "slipped_exit": slipped_exit,
+            "slippage_points": slippage_points,
+            "slippage_dollars": slippage_dollars,
             "minutes_after_open": market.minutes_after_open,
             "time_bucket": get_time_bucket(getattr(market, "minutes_after_open", None)),
             "reason": signal.reason,
