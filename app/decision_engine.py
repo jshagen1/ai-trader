@@ -35,6 +35,12 @@ class DecisionEngine:
                 "TIME_FILTER",
                 f"Blocked weak opening window: {minutes_after_open}"
             )
+            
+        if 90 <= minutes_after_open < 150:
+            return self.hold(
+                "TIME_FILTER",
+                f"Blocked weak mid-session: {minutes_after_open}"
+            )
 
         if market.chop_score >= 0.55:
             return self.hold("CHOP_FILTER", f"Chop too high: {market.chop_score:.2f}")
@@ -78,7 +84,7 @@ class DecisionEngine:
         if m.trend_score >= 0.7:
             long_score += 0.20
 
-        if m.avg_volume and m.volume > m.avg_volume * 1.20:
+        if m.avg_volume and m.volume > m.avg_volume * 1.25:
             long_score += 0.15
 
         if 55 <= m.rsi <= 72:
@@ -98,7 +104,7 @@ class DecisionEngine:
         if m.trend_score >= 0.7:
             short_score += 0.20
 
-        if m.avg_volume and m.volume > m.avg_volume * 1.20:
+        if m.avg_volume and m.volume > m.avg_volume * 1.25:
             short_score += 0.15
 
         if 28 <= m.rsi <= 45:

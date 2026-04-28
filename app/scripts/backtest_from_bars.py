@@ -13,6 +13,8 @@ DB_FILE = ROOT / "trades.db"
 POINT_VALUE = 50.0
 MAX_LOOKAHEAD_BARS = 20
 
+import math
+
 def get_time_bucket(minutes):
     try:
         minutes = float(minutes)
@@ -24,16 +26,31 @@ def get_time_bucket(minutes):
 
     minutes = int(minutes)
 
+    # Early session
     if minutes < 30:
         return "0-30"
     if minutes < 60:
         return "30-60"
+    if minutes < 90:
+        return "60-90"
     if minutes < 120:
-        return "60-120"
-    if minutes <= 180:
-        return "120-180"
+        return "90-120"
 
-    return "180+"
+    # Mid session
+    if minutes < 150:
+        return "120-150"
+    if minutes < 180:
+        return "150-180"
+
+    # Late session (THIS is the important split)
+    if minutes < 240:
+        return "180-240"
+    if minutes < 300:
+        return "240-300"
+    if minutes < 390:
+        return "300-390"
+
+    return "390+"
 
 
 def to_market_state(row):
@@ -122,6 +139,28 @@ def analyze_results(trades):
         print(f"Profit Factor: {profit_factor2:.2f}")
     else:
         print("Not enough trades to remove largest winner.")
+
+    print("\nWithout top 2 largest winners")
+    print("------------------------------")
+
+    if len(df) > 2:
+        top2_idx = df["pnl"].nlargest(2).index
+        df_without_top2 = df.drop(top2_idx)
+
+        wins_top2 = df_without_top2[df_without_top2["pnl"] > 0]
+        losses_top2 = df_without_top2[df_without_top2["pnl"] <= 0]
+
+        gross_profit_top2 = wins_top2["pnl"].sum()
+        gross_loss_top2 = abs(losses_top2["pnl"].sum())
+        profit_factor_top2 = (
+            gross_profit_top2 / gross_loss_top2 if gross_loss_top2 else float("inf")
+        )
+
+        print(f"Trades: {len(df_without_top2)}")
+        print(f"Net PnL: ${df_without_top2['pnl'].sum():.2f}")
+        print(f"Profit Factor: {profit_factor_top2:.2f}")
+    else:
+        print("Not enough trades to remove top 2 largest winners.")
 
     wins = df[df["pnl"] > 0]
     losses = df[df["pnl"] <= 0]

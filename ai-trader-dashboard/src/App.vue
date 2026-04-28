@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted } from "vue";
+import { ref, onMounted, computed } from "vue";
 import axios from "axios";
 import {
   Chart as ChartJS,
@@ -20,6 +20,85 @@ const fetchSummary = async () => {
   const res = await axios.get("http://localhost:8000/dashboard/summary");
   summary.value = res.data;
 };
+
+const equityCurve = computed(() => summary.value?.equity_curve ?? []);
+
+const chartData = computed(() => ({
+  labels: equityCurve.value.map((x) => String(x.trade)),
+  datasets: [
+    {
+      label: "Cumulative equity",
+      data: equityCurve.value.map((x) => x.equity),
+      borderColor: "#2563eb",
+      backgroundColor: "rgba(37, 99, 235, 0.12)",
+      borderWidth: 2,
+      tension: 0.2,
+      pointRadius: 3,
+      pointHoverRadius: 6,
+      pointHoverBorderWidth: 2,
+    },
+  ],
+}));
+
+const formatMoney = (value) =>
+  Number(value).toLocaleString(undefined, {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
+
+const chartOptions = computed(() => {
+  const curve = equityCurve.value;
+  return {
+    responsive: true,
+    maintainAspectRatio: false,
+    interaction: {
+      mode: "index",
+      intersect: false,
+    },
+    plugins: {
+      legend: {
+        display: true,
+        position: "top",
+      },
+      tooltip: {
+        enabled: true,
+        callbacks: {
+          title: (items) => {
+            const i = items[0]?.dataIndex;
+            const row = curve[i];
+            return row != null ? `Trade ${row.trade}` : "";
+          },
+          label: (item) => {
+            const y = item.parsed?.y ?? item.raw;
+            return `Equity: $${formatMoney(y)}`;
+          },
+        },
+      },
+    },
+    scales: {
+      x: {
+        title: {
+          display: true,
+          text: "Trade #",
+        },
+        ticks: {
+          maxRotation: 45,
+          autoSkip: true,
+          maxTicksLimit: 12,
+        },
+      },
+      y: {
+        title: {
+          display: true,
+          text: "Equity ($)",
+        },
+        ticks: {
+          callback: (value) => `$${formatMoney(value)}`,
+        },
+      },
+    },
+  };
+});
 
 onMounted(fetchSummary);
 </script>
@@ -66,21 +145,9 @@ onMounted(fetchSummary);
       <div class="panel">
         <h2>Equity Curve</h2>
 
-        <Line
-          :data="{
-            labels: summary.equity_curve.map(x => x.trade),
-            datasets: [
-              {
-                label: 'Equity',
-                data: summary.equity_curve.map(x => x.equity),
-              }
-            ]
-          }"
-          :options="{
-            responsive: true,
-            plugins: { legend: { display: false } }
-          }"
-        />
+        <div class="chart-wrap">
+          <Line :data="chartData" :options="chartOptions" />
+        </div>
       </div>
 
       <div class="panel">
@@ -149,6 +216,12 @@ onMounted(fetchSummary);
 
 .panel {
   margin-top: 24px;
+}
+
+.chart-wrap {
+  position: relative;
+  height: 360px;
+  margin-top: 12px;
 }
 
 table {
