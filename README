@@ -1,0 +1,345 @@
+# AI Trader (ORB Strategy + ML Filter)
+
+## Overview
+
+This project is a **rule-based + ML-assisted trading system** focused on:
+
+- Opening Range Breakout (ORB) strategy
+- Time-of-day edge filtering
+- Dynamic position sizing
+- Realistic execution (slippage-aware backtesting)
+
+It is designed to:
+
+- Backtest high-probability intraday futures setups
+- Serve trade signals via API
+- Integrate with NinjaTrader for execution
+
+---
+
+## Core Features
+
+- ORB breakout detection (VWAP + range context)
+- ML probability filter (RandomForest)
+- Time-of-day performance filtering
+- Dynamic risk sizing per trade
+- Slippage simulation (ES tick-based)
+- Backtesting + analytics (PnL, PF, drawdown, etc.)
+- FastAPI-based signal API
+
+---
+
+## Requirements
+
+### 1. Python
+
+- Python 3.10+
+- Virtual environment recommended
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+### 2. NinjaTrader (Required for data + execution)
+
+You need:
+
+- NinjaTrader desktop installed
+- Live or funded account (NOT simulation-only)
+- Historical data access (Continuum, Rithmic, or Kinetick)
+
+⚠️ **Simulation-only accounts do NOT support historical data download.**
+
+---
+
+## Data Pipeline
+
+### Step 1 — Export data from NinjaTrader
+
+Use chart export (most reliable):
+
+**New → Chart → ES 06-26 → 1 Minute** → Right-click → **Data Series** → set **Days to Load** → Right-click → **Export** → **Export Chart Data**
+
+**Output format:**
+
+```text
+YYYYMMDD HHMMSS;open;high;low;close;volume
+```
+
+### Step 2 — Convert to CSV
+
+```bash
+python3 -m app.scripts.convert_nt_text_to_csv "/path/to/data.txt" "/path/to/data.csv"
+```
+
+### Step 3 — Load into database
+
+```bash
+python3 -m app.scripts.import_bars_from_csv "/path/to/data.csv" "ES JUN26"
+```
+
+---
+
+## Running Backtests
+
+```bash
+python3 -m app.scripts.backtest_from_bars
+```
+
+**Outputs:**
+
+- Trade stats (PnL, Profit Factor, Win Rate)
+- Drawdown
+- Slippage analysis
+- Time bucket performance
+
+---
+
+## Running the API
+
+Start the FastAPI server:
+
+```bash
+uvicorn app.main:app --reload
+```
+
+**Default:** [http://127.0.0.1:8000](http://127.0.0.1:8000)
+
+---
+
+## Vue.js Dashboard
+
+A Vue.js dashboard can be used to visualize strategy performance from the FastAPI backend.
+
+### Dashboard purpose
+
+The dashboard is intended to display:
+
+- Total trades
+- Win rate
+- Net PnL
+- Expectancy
+- Profit factor
+- Max drawdown
+- Equity curve
+- Recent completed trades
+
+---
+
+### Running the dashboard
+
+From the project root, create or enter the dashboard app:
+
+```bash
+cd ai-trader-dashboard
+```
+
+Install dependencies:
+
+```bash
+npm install
+```
+
+Start the Vue dev server:
+
+```bash
+npm run dev
+```
+
+**Default local URL:** [http://localhost:5173](http://localhost:5173)
+
+#### Backend requirement
+
+The FastAPI backend must also be running:
+
+```bash
+uvicorn app.main:app --reload
+```
+
+The dashboard expects the API at:
+
+[http://127.0.0.1:8000](http://127.0.0.1:8000)
+
+#### Dashboard API endpoint
+
+The dashboard reads summary data from:
+
+**GET** `/dashboard/summary`
+
+Example response:
+
+```json
+{
+  "total_trades": 25,
+  "win_rate": 68.0,
+  "net_pnl": 2012.23,
+  "expectancy": 80.49,
+  "profit_factor": 2.44,
+  "max_drawdown": -402.97,
+  "equity_curve": [],
+  "recent_trades": []
+}
+```
+
+#### CORS
+
+The backend currently allows the Vue dev server origin:
+
+```python
+allow_origins=["http://localhost:5173"]
+```
+
+If the dashboard runs on a different host or port, update CORS in `app/main.py`.
+
+#### Recommended dashboard structure
+
+```text
+ai-trader-dashboard/
+  src/
+    App.vue
+    components/
+      SummaryCards.vue
+      EquityCurve.vue
+      RecentTradesTable.vue
+      TimeBucketBreakdown.vue
+```
+
+#### Suggested dashboard views
+
+**Summary cards** — show:
+
+- Net PnL
+- Win rate
+- Profit factor
+- Max drawdown
+- Total trades
+
+**Equity curve** — line chart showing cumulative PnL over time.
+
+**Recent trades** — table of latest completed trades.
+
+**Strategy breakdown** (optional future view) — performance by:
+
+- Strategy
+- Time bucket
+- Long vs short
+- Slippage impact
+
+#### Dashboard notes
+
+The dashboard is for monitoring and analysis only. It should not be treated as a trade execution interface unless additional safeguards are added.
+
+---
+
+## API Usage
+
+### Get signal
+
+**POST** `/signal`
+
+Example request (illustrative subset — real calls must send a full `MarketState`; see `app/models/market_state.py`):
+
+```json
+{
+  "symbol": "ES",
+  "close": 5300,
+  "high": 5310,
+  "low": 5290,
+  "vwap": 5295,
+  "atr": 10,
+  "minutes_after_open": 120
+}
+```
+
+Example response (stop / target in trading terms = `stop_loss` / `take_profit` in JSON):
+
+```json
+{
+  "action": "BUY",
+  "entry": 5300,
+  "stop_loss": 5285,
+  "take_profit": 5330,
+  "strategy": "ORB_BREAKOUT",
+  "confidence": 0.75,
+  "quantity": 1,
+  "reason": "…"
+}
+```
+
+---
+
+## Strategy Logic (High-Level)
+
+The system trades:
+
+- ORB breakout above/below range
+- Confirmed by VWAP alignment
+- Filtered by ML probability
+- Filtered by time-of-day edge
+- Sized based on risk + volatility
+
+**Key filters:**
+
+- Avoid first 15 minutes
+- Avoid weak mid-session windows
+- Focus on high-performing time buckets
+
+---
+
+## Slippage Model
+
+Simulated as:
+
+**1 tick per side (ES)** ≈ **$25 per trade per contract**
+
+This ensures realistic backtest performance.
+
+---
+
+## Project Structure
+
+```text
+app/
+  main.py
+  decision_engine.py
+  machine_learning/
+    features.py
+    model.pkl
+  scripts/
+    backtest_from_bars.py
+    import_bars_from_csv.py
+    convert_nt_text_to_csv.py
+trades.db
+```
+
+(`trades.db` is at the project root next to `app/`.)
+
+---
+
+## Notes
+
+- Backtests use historical bar data, not tick-level execution.
+- Results depend heavily on:
+  - Data quality
+  - Session filtering (RTH vs ETH)
+  - Slippage assumptions
+- Avoid overfitting thresholds — validate on larger datasets.
+
+---
+
+## Next Improvements
+
+- Walk-forward testing
+- Live execution bridge to NinjaTrader
+- Limit/market fill simulation
+- Multi-contract scaling
+
+---
+
+## Disclaimer
+
+This project is for **research and educational purposes only**.
+
+Trading futures involves substantial risk and is not suitable for all investors.
