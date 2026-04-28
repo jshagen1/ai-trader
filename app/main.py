@@ -1,15 +1,29 @@
+from __future__ import annotations
+
+from typing import Any
+
 import pandas as pd
 from fastapi import FastAPI
-from app.constants import POINT_VALUE
+from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.orm import Session
+
+from app.analytics.dashboard import build_dashboard_summary
+from app.constants import (
+    CORS_ALLOW_ORIGINS,
+    HEALTH_STATUS_OK,
+    MANAGE_POSITION_RESPONSE_NEW_STOP,
+    POINT_VALUE,
+    POSITION_ACTION_UPDATE_STOP,
+    RECENT_BARS_QUERY_LIMIT_DEFAULT,
+)
+from app.decision_engine import DecisionEngine
+from app.db.database import Base
+from app.db.database import SessionLocal
+from app.db.database import engine
+from app.db.models_db import CompletedTrade, MarketBar, TradeLog
 from app.models.market_state import MarketState
 from app.models.trade_signal import TradeSignal
-from app.decision_engine import DecisionEngine
 from app.slippage import trade_slippage_points_and_dollars
-from app.db.database import Base
-from app.db.database import engine
-from app.db.database import SessionLocal
-from app.db.models_db import TradeLog, CompletedTrade, MarketBar
-from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
 decision_engine = DecisionEngine()
@@ -18,18 +32,20 @@ Base.metadata.create_all(bind=engine)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=list(CORS_ALLOW_ORIGINS),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+
 @app.get("/health")
-def health():
-    return {"status": "ok"}
+def health() -> dict[str, str]:
+    return {"status": HEALTH_STATUS_OK}
+
 
 @app.post("/trade")
-def log_trade(data: dict):
+def log_trade(data: dict[str, Any]) -> dict[str, str]:
     db = SessionLocal()
 
     quantity = data.get("quantity") or 1
@@ -66,11 +82,12 @@ def log_trade(data: dict):
     db.commit()
     db.close()
 
-    return {"status": "ok"}
+    return {"status": HEALTH_STATUS_OK}
+
 
 @app.post("/signal", response_model=TradeSignal)
-def get_signal(market: MarketState):
-    db = SessionLocal()
+def get_signal(market: MarketState) -> TradeSignal:
+    db: Session = SessionLocal()
 
     try:
         bar = MarketBar(
@@ -94,7 +111,9 @@ def get_signal(market: MarketState):
         db.add(bar)
         db.commit()
 
-        recent_bars = decision_engine.get_recent_bars(db, market.symbol, limit=50)
+        recent_bars = decision_engine.get_recent_bars(
+            db, market.symbol, limit=RECENT_BARS_QUERY_LIMIT_DEFAULT
+        )
 
         signal = decision_engine.decide(market, recent_bars)
 
@@ -114,9 +133,9 @@ def get_signal(market: MarketState):
             action=signal.action,
             strategy=signal.strategy,
             confidence=signal.confidence,
-            reason=signal.reason
+            reason=signal.reason,
         )
-        
+
         db.add(log)
         db.commit()
 
@@ -125,68 +144,23 @@ def get_signal(market: MarketState):
     finally:
         db.close()
 
+
 @app.post("/manage-position")
-def manage_position(position: dict):
+def manage_position(position: dict[str, Any]) -> dict[str, Any]:
     new_stop = decision_engine.adjust_trailing_stop(position)
 
     return {
-        "action": "UPDATE_STOP",
-        "new_stop_loss": new_stop
+        "action": POSITION_ACTION_UPDATE_STOP,
+        MANAGE_POSITION_RESPONSE_NEW_STOP: new_stop,
     }
 
 
 @app.get("/dashboard/summary")
-def dashboard_summary():
-    db = SessionLocal()
+def dashboard_summary() -> dict[str, Any]:
+    db: Session = SessionLocal()
 
     try:
         df = pd.read_sql("SELECT * FROM completed_trades", db.bind)
-
-        if df.empty:
-            return {
-                "total_trades": 0,
-                "win_rate": 0,
-                "net_pnl": 0,
-                "expectancy": 0,
-                "profit_factor": 0,
-                "max_drawdown": 0,
-                "equity_curve": [],
-                "recent_trades": [],
-            }
-
-        wins = df[df["pnl"] > 0]
-        losses = df[df["pnl"] <= 0]
-
-        total = len(df)
-        win_rate = len(wins) / total if total else 0
-
-        avg_win = wins["pnl"].mean() if len(wins) else 0
-        avg_loss = abs(losses["pnl"].mean()) if len(losses) else 0
-        loss_rate = 1 - win_rate
-
-        expectancy = (win_rate * avg_win) - (loss_rate * avg_loss)
-
-        gross_profit = wins["pnl"].sum()
-        gross_loss = abs(losses["pnl"].sum())
-        profit_factor = gross_profit / gross_loss if gross_loss > 0 else 0
-
-        df["equity"] = df["pnl"].cumsum()
-        df["running_max"] = df["equity"].cummax()
-        df["drawdown"] = df["equity"] - df["running_max"]
-
-        return {
-            "total_trades": total,
-            "win_rate": round(win_rate * 100, 2),
-            "net_pnl": round(df["pnl"].sum(), 2),
-            "expectancy": round(expectancy, 2),
-            "profit_factor": round(profit_factor, 2),
-            "max_drawdown": round(df["drawdown"].min(), 2),
-            "equity_curve": [
-                {"trade": i + 1, "equity": round(row["equity"], 2)}
-                for i, row in df.iterrows()
-            ],
-            "recent_trades": df.tail(20).to_dict(orient="records"),
-        }
-
+        return build_dashboard_summary(df)
     finally:
         db.close()

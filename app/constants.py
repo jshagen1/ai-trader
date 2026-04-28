@@ -1,2 +1,116 @@
-# Dollar per index point for PnL / slippage (instrument-specific; ES default).
+"""Application-wide constants"""
+
+from __future__ import annotations
+
+# --- PnL / instrument (ES-style index) ---
 POINT_VALUE = 50.0
+
+# --- Execution simulation (backtests) ---
+ES_TICK_SIZE = 0.25
+ES_SLIPPAGE_TICKS_PER_SIDE = 1
+SLIPPAGE_POINTS_PER_SIDE = ES_SLIPPAGE_TICKS_PER_SIDE * ES_TICK_SIZE
+
+# --- API / HTTP ---
+CORS_ALLOW_ORIGINS: tuple[str, ...] = (
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+)
+
+HEALTH_STATUS_OK = "ok"
+
+# --- Position / bridge payloads ---
+POSITION_ACTION_UPDATE_STOP = "UPDATE_STOP"
+MANAGE_POSITION_RESPONSE_NEW_STOP = "new_stop_loss"
+POSITION_KEY_ENTRY_PRICE = "entry_price"
+POSITION_KEY_CURRENT_PRICE = "current_price"
+POSITION_KEY_STOP_LOSS = "stop_loss"
+POSITION_KEY_INITIAL_STOP = "initial_stop"
+POSITION_KEY_ACTION = "action"
+POSITION_KEY_ATR = "atr"
+
+# --- Market session ---
+MINUTES_AFTER_OPEN_INVALID_SENTINEL = 999
+MINUTES_AFTER_OPEN_ORB_CONTEXT = 15
+
+# Session windows blocked in `decide()` — [start, end) minutes after open
+SESSION_WEAK_OPENING_START = 30
+SESSION_WEAK_OPENING_END = 60
+
+SESSION_WEAK_MID_A_START = 90
+SESSION_WEAK_MID_A_END = 150
+
+SESSION_WEAK_MID_B_START = 180
+SESSION_WEAK_MID_B_END = 240
+
+# --- Decision filters ---
+CHOP_SCORE_MAX = 0.55
+TREND_SCORE_MIN = 0.65
+
+# --- ORB strategy ---
+STRATEGY_ORB_ATR_MULTIPLIER = 1.25
+STRATEGY_ORB_REWARD_RISK_RATIO = 2.0
+
+ORB_LONG_SCORE_THRESHOLD = 0.70
+ORB_SHORT_SCORE_THRESHOLD = 0.70
+ORB_LONG_ML_THRESHOLD = 0.55
+ORB_SHORT_ML_THRESHOLD = 0.45
+
+ORB_TREND_SCORE_FOR_WEIGHT = 0.7
+ORB_VOLUME_SURGE_MULTIPLIER = 1.25
+
+# Long score weights
+ORB_LONG_WEIGHT_BREAK_ORB = 0.30
+ORB_LONG_WEIGHT_ABOVE_VWAP = 0.20
+ORB_LONG_WEIGHT_TREND = 0.20
+ORB_LONG_WEIGHT_VOLUME = 0.15
+ORB_LONG_WEIGHT_RSI = 0.10
+ORB_LONG_WEIGHT_TIME = 0.05
+ORB_LONG_RSI_LOW = 55
+ORB_LONG_RSI_HIGH = 72
+
+# Short score weights (same structure as long)
+ORB_SHORT_WEIGHT_BREAK_ORB = 0.30
+ORB_SHORT_WEIGHT_BELOW_VWAP = 0.20
+ORB_SHORT_WEIGHT_TREND = 0.20
+ORB_SHORT_WEIGHT_VOLUME = 0.15
+ORB_SHORT_WEIGHT_RSI = 0.10
+ORB_SHORT_WEIGHT_TIME = 0.05
+ORB_SHORT_RSI_LOW = 28
+ORB_SHORT_RSI_HIGH = 45
+
+ORB_RISK_BASE_MAX_POINTS = 7.5
+
+ML_PROBABILITY_DEFAULT_NO_MODEL = 0.5
+
+# --- Position sizing (ORB) ---
+QUANTITY_MAX_RISK_DOLLARS_DEFAULT = 100.0
+QUANTITY_MAX_CONTRACTS_DEFAULT = 3
+
+# --- Trailing stop (adjust_trailing_stop) ---
+TRAIL_PROFIT_MULTIPLIER_TIER_1 = 1.0
+TRAIL_PROFIT_MULTIPLIER_TIER_2 = 1.5
+TRAIL_PROFIT_MULTIPLIER_TIER_3 = 2.0
+TRAIL_ATR_TIGHTEN_MULTIPLIER = 0.75
+TRAIL_LOCK_FRACTION_OF_INITIAL = 0.5
+
+# --- Backtest ---
+BACKTEST_MAX_LOOKAHEAD_BARS = 20
+BACKTEST_RECENT_BARS_WINDOW = 50
+BACKTEST_SKIP_BARS_AFTER_TRADE = 5
+
+# --- API data access ---
+RECENT_BARS_QUERY_LIMIT_DEFAULT = 50
+
+
+def orb_max_risk_points(minutes_after_open: int) -> float:
+    """Dynamic stop-width cap (points) from time-of-day."""
+    m = minutes_after_open
+    if 150 <= m < 180:
+        mult = 1.3
+    elif 240 <= m < 300:
+        mult = 1.0
+    elif 300 <= m <= 390:
+        mult = 1.1
+    else:
+        mult = 0.8
+    return ORB_RISK_BASE_MAX_POINTS * mult

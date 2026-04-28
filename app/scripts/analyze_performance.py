@@ -1,25 +1,22 @@
+from __future__ import annotations
+
 from pathlib import Path
-from sqlalchemy import create_engine
+from typing import Any
+
 import pandas as pd
+from sqlalchemy import create_engine
+from sqlalchemy.engine import Engine
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DB_FILE = PROJECT_ROOT / "trades.db"
-DB_PATH = f"sqlite:///{DB_FILE}"
-POINT_VALUE = 5.0 # ES $50 per point
-
-
-def calculate_pnl(action, entry, exit_price, quantity=1):
-    if action == "BUY":
-        return (exit_price - entry) * POINT_VALUE * quantity
-
-    if action == "SELL":
-        return (entry - exit_price) * POINT_VALUE * quantity
-
-    return 0
+from app.paths import default_trades_db_path
+from app.pnl import calculate_pnl
 
 
-def analyze():
-    engine = create_engine(DB_PATH)
+PROJECT_ROOT: Path = Path(__file__).resolve().parents[2]
+DB_PATH: str = f"sqlite:///{default_trades_db_path()}"
+
+
+def analyze() -> None:
+    engine: Engine = create_engine(DB_PATH)
 
     df = pd.read_sql("SELECT * FROM completed_trades", engine)
 
@@ -27,18 +24,24 @@ def analyze():
         print("No logs found.")
         return
 
-    # Keep only actual trades
     trades = df.copy()
 
     if trades.empty:
         print("No BUY/SELL trades found yet.")
         return
 
-    # Calculate PnL if not already populated
+    def _completed_trade_pnl(r: Any) -> float:
+        return calculate_pnl(
+            r["action"],
+            r["entry_price"],
+            r["exit_price"],
+            r.get("quantity", 1) or 1,
+        )
+
     if "pnl" not in trades.columns:
-        trades["pnl"] = trades.apply(calculate_pnl, axis=1)
+        trades["pnl"] = trades.apply(_completed_trade_pnl, axis=1)
     else:
-        trades["pnl"] = trades["pnl"].fillna(trades.apply(calculate_pnl, axis=1))
+        trades["pnl"] = trades["pnl"].fillna(trades.apply(_completed_trade_pnl, axis=1))
 
     trades = trades.dropna(subset=["pnl"])
 
@@ -96,7 +99,7 @@ def analyze():
         net_pnl="sum",
         avg_pnl="mean",
         best="max",
-        worst="min"
+        worst="min",
     )
     print(by_strategy)
 
@@ -109,12 +112,13 @@ def analyze():
         by_hour = trades.groupby("hour")["pnl"].agg(
             trades="count",
             net_pnl="sum",
-            avg_pnl="mean"
+            avg_pnl="mean",
         )
         print(by_hour)
 
-    trades.to_csv("performance_report.csv", index=False)
-    print("\nSaved detailed report to performance_report.csv")
+    out_csv = PROJECT_ROOT / "performance_report.csv"
+    trades.to_csv(out_csv, index=False)
+    print(f"\nSaved detailed report to {out_csv}")
 
 
 if __name__ == "__main__":

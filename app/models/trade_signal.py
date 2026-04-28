@@ -1,12 +1,15 @@
-from pydantic import BaseModel
-from typing import Optional
+from __future__ import annotations
 
-class TradeSignal(BaseModel):
+from dataclasses import dataclass
+
+
+@dataclass(slots=True)
+class TradeSignal:
     action: str
     strategy: str
     confidence: float
-    entry: Optional[float] = None
-    stop_loss: Optional[float] = None
-    take_profit: Optional[float] = None
-    quantity: Optional[int] = 1
     reason: str
+    entry: float | None = None
+    stop_loss: float | None = None
+    take_profit: float | None = None
+    quantity: int = 1

@@ -1,11 +1,13 @@
 from pathlib import Path
 from datetime import time
 import sys
+
 import pandas as pd
 from sqlalchemy import create_engine, text
 
-ROOT = Path(__file__).resolve().parents[2]
-DB_FILE = ROOT / "trades.db"
+from app.paths import default_trades_db_path
+
+DB_FILE = default_trades_db_path()
 
 csv_path = Path(sys.argv[1])
 symbol = sys.argv[2] if len(sys.argv) > 2 else "ES JUN26"

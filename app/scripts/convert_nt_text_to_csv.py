@@ -1,9 +1,12 @@
+from __future__ import annotations
+
 from pathlib import Path
 import sys
+
 import pandas as pd
 
 
-def main():
+def main() -> None:
     input_path = Path(sys.argv[1])
     output_path = Path(sys.argv[2])
 

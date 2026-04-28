@@ -1,78 +1,38 @@
+from __future__ import annotations
+
 from pathlib import Path
 from types import SimpleNamespace
-import math
+from typing import Any
 
 import pandas as pd
 from sqlalchemy import create_engine
+from sqlalchemy.engine import Engine
 
-from app.constants import POINT_VALUE
+from app.models.trade_signal import TradeSignal
+
+from app.constants import (
+    BACKTEST_MAX_LOOKAHEAD_BARS,
+    BACKTEST_RECENT_BARS_WINDOW,
+    BACKTEST_SKIP_BARS_AFTER_TRADE,
+    MINUTES_AFTER_OPEN_INVALID_SENTINEL,
+    POINT_VALUE,
+)
 from app.decision_engine import DecisionEngine
-from app.slippage import trade_slippage_points_and_dollars
+from app.enums import Action, ExitReason, PositionStatus
+from app.paths import PROJECT_ROOT, default_trades_db_path
+from app.pnl import calculate_pnl
+from app.slippage import (
+    apply_entry_slippage,
+    apply_exit_slippage,
+    trade_slippage_points_and_dollars,
+)
+from app.time_buckets import time_bucket_label
 
 
-ROOT = Path(__file__).resolve().parents[2]
-DB_FILE = ROOT / "trades.db"
-
-MAX_LOOKAHEAD_BARS = 20
-
-SLIPPAGE_TICKS = 1
-TICK_SIZE = 0.25
-SLIPPAGE_POINTS = SLIPPAGE_TICKS * TICK_SIZE
-
-def get_time_bucket(minutes):
-    try:
-        minutes = float(minutes)
-    except (TypeError, ValueError):
-        return "INVALID"
-
-    if math.isnan(minutes):
-        return "INVALID"
-
-    minutes = int(minutes)
-
-    # Early session
-    if minutes < 30:
-        return "0-30"
-    if minutes < 60:
-        return "30-60"
-    if minutes < 90:
-        return "60-90"
-    if minutes < 120:
-        return "90-120"
-
-    # Mid session
-    if minutes < 150:
-        return "120-150"
-    if minutes < 180:
-        return "150-180"
-
-    # Late session (THIS is the important split)
-    if minutes < 240:
-        return "180-240"
-    if minutes < 300:
-        return "240-300"
-    if minutes < 390:
-        return "300-390"
-
-    return "390+"
-
-def apply_entry_slippage(action, entry):
-    if action == "BUY":
-        return entry + SLIPPAGE_POINTS
-    if action == "SELL":
-        return entry - SLIPPAGE_POINTS
-    return entry
+DB_FILE: Path = default_trades_db_path()
 
 
-def apply_exit_slippage(action, exit_price):
-    if action == "BUY":
-        return exit_price - SLIPPAGE_POINTS
-    if action == "SELL":
-        return exit_price + SLIPPAGE_POINTS
-    return exit_price
-
-
-def to_market_state(row):
+def to_market_state(row: Any) -> SimpleNamespace:
     return SimpleNamespace(
         symbol=row["symbol"],
         timestamp=row["timestamp"],
@@ -90,50 +50,48 @@ def to_market_state(row):
         avg_volume=row.get("avg_volume", 0),
         trend_score=row["trend_score"],
         chop_score=row["chop_score"],
-        position="flat",
-        minutes_after_open=row.get("minutes_after_open", 999),
+        position=PositionStatus.FLAT.value,
+        minutes_after_open=row.get(
+            "minutes_after_open", MINUTES_AFTER_OPEN_INVALID_SENTINEL
+        ),
     )
 
 
-def simulate_exit(bars, entry_index, signal):
+def simulate_exit(
+    bars: pd.DataFrame,
+    entry_index: int,
+    signal: TradeSignal,
+) -> tuple[float, str, str | None]:
+    if signal.entry is None or signal.stop_loss is None or signal.take_profit is None:
+        raise ValueError("simulate_exit requires entry, stop_loss, and take_profit")
     entry = signal.entry
     stop = signal.stop_loss
     target = signal.take_profit
     action = signal.action
 
-    future = bars.iloc[entry_index + 1:entry_index + 1 + MAX_LOOKAHEAD_BARS]
+    future = bars.iloc[entry_index + 1 : entry_index + 1 + BACKTEST_MAX_LOOKAHEAD_BARS]
 
     for _, row in future.iterrows():
-        if action == "BUY":
+        if action == Action.BUY.value:
             if row["low"] <= stop:
-                return stop, "STOP", row["timestamp"]
+                return stop, ExitReason.STOP.value, row["timestamp"]
             if row["high"] >= target:
-                return target, "TARGET", row["timestamp"]
+                return target, ExitReason.TARGET.value, row["timestamp"]
 
-        if action == "SELL":
+        if action == Action.SELL.value:
             if row["high"] >= stop:
-                return stop, "STOP", row["timestamp"]
+                return stop, ExitReason.STOP.value, row["timestamp"]
             if row["low"] <= target:
-                return target, "TARGET", row["timestamp"]
+                return target, ExitReason.TARGET.value, row["timestamp"]
 
     if len(future) == 0:
-        return entry, "NO_DATA", None
+        return entry, ExitReason.NO_DATA.value, None
 
     last = future.iloc[-1]
-    return last["close"], "TIME_EXIT", last["timestamp"]
+    return last["close"], ExitReason.TIME_EXIT.value, last["timestamp"]
 
 
-def calculate_pnl(action, entry, exit_price, quantity=1):
-    if action == "BUY":
-        return (exit_price - entry) * POINT_VALUE * quantity
-
-    if action == "SELL":
-        return (entry - exit_price) * POINT_VALUE * quantity
-
-    return 0
-
-
-def analyze_results(trades):
+def analyze_results(trades: list[dict[str, Any]]) -> None:
     if not trades:
         print("No trades taken.")
         return
@@ -238,13 +196,13 @@ def analyze_results(trades):
         .agg(["count", "sum", "mean", "min", "max"])
     )
 
-    out = ROOT / "backtest_results.csv"
+    out = PROJECT_ROOT / "backtest_results.csv"
     df.to_csv(out, index=False)
     print(f"\nSaved: {out}")
 
 
-def main():
-    engine = create_engine(f"sqlite:///{DB_FILE}")
+def main() -> None:
+    engine: Engine = create_engine(f"sqlite:///{DB_FILE}")
     decision_engine = DecisionEngine()
 
     bars = pd.read_sql(
@@ -270,19 +228,21 @@ def main():
     trades = []
     skip_until_index = -1
 
-    for i in range(len(bars) - MAX_LOOKAHEAD_BARS):
+    for i in range(len(bars) - BACKTEST_MAX_LOOKAHEAD_BARS):
         if i % 1000 == 0:
             print(f"Processing bar {i}/{len(bars)}")
 
         if i <= skip_until_index:
             continue
 
-        recent_bars = bars.iloc[max(0, i - 50):i].to_dict("records")
+        recent_bars = bars.iloc[max(0, i - BACKTEST_RECENT_BARS_WINDOW) : i].to_dict(
+            "records"
+        )
         market = to_market_state(bars.iloc[i])
 
         signal = decision_engine.decide(market, recent_bars)
 
-        if signal.action not in ["BUY", "SELL"]:
+        if signal.action not in (Action.BUY.value, Action.SELL.value):
             continue
 
         quantity = getattr(signal, "quantity", 1) or 1
@@ -322,13 +282,15 @@ def main():
             "slippage_points": slippage_points,
             "slippage_dollars": slippage_dollars,
             "minutes_after_open": market.minutes_after_open,
-            "time_bucket": get_time_bucket(getattr(market, "minutes_after_open", None)),
+            "time_bucket": time_bucket_label(
+                getattr(market, "minutes_after_open", None)
+            ),
             "reason": signal.reason,
         }
 
         trades.append(trade)
 
-        skip_until_index = i + 5
+        skip_until_index = i + BACKTEST_SKIP_BARS_AFTER_TRADE
 
     analyze_results(trades)
 

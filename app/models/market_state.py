@@ -1,6 +1,10 @@
-from pydantic import BaseModel
+from __future__ import annotations
 
-class MarketState(BaseModel):
+from dataclasses import dataclass
+
+
+@dataclass(slots=True)
+class MarketState:
     symbol: str
     timestamp: str
     price: float

@@ -1,22 +1,27 @@
+from __future__ import annotations
+
 from pathlib import Path
-import pandas as pd
-from sqlalchemy import create_engine
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report
+from typing import Literal
+
 import joblib
+import pandas as pd
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import classification_report
+from sklearn.model_selection import train_test_split
+from sqlalchemy import create_engine
+from sqlalchemy.engine import Engine
 
 from app.machine_learning.features import build_features
+from app.paths import default_trades_db_path
 
-ROOT = Path(__file__).resolve().parents[2]
-DB = ROOT / "trades.db"
-MODEL_PATH = ROOT / "app" / "machine_learning" / "model.pkl"
+DB = default_trades_db_path()
+MODEL_PATH = Path(__file__).resolve().parent / "model.pkl"
 
 LOOKAHEAD_BARS = 20
 RISK_ATR_MULTIPLIER = 1.25
 REWARD_MULTIPLIER = 2.0
 
-engine = create_engine(f"sqlite:///{DB}")
+engine: Engine = create_engine(f"sqlite:///{DB}")
 bars = pd.read_sql("SELECT * FROM market_bars ORDER BY timestamp ASC", engine)
 
 bars = bars.dropna(subset=[
@@ -26,7 +31,11 @@ bars = bars.dropna(subset=[
 ]).reset_index(drop=True)
 
 
-def did_hit_target_before_stop(bars, index, direction):
+def did_hit_target_before_stop(
+    bars: pd.DataFrame,
+    index: int,
+    direction: Literal["LONG", "SHORT"],
+) -> int | None:
     row = bars.iloc[index]
 
     entry = row["close"]
