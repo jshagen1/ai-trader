@@ -41,6 +41,12 @@ class DecisionEngine:
                 "TIME_FILTER",
                 f"Blocked weak mid-session: {minutes_after_open}"
             )
+            
+        if 180 <= minutes_after_open < 240:
+            return self.hold(
+                "TIME_FILTER",
+                f"Blocked weak mid-session: {minutes_after_open}"
+            )
 
         if market.chop_score >= 0.55:
             return self.hold("CHOP_FILTER", f"Chop too high: {market.chop_score:.2f}")
@@ -64,14 +70,33 @@ class DecisionEngine:
         SHORT_ML_THRESHOLD = 0.45
 
         risk = m.atr * 1.25
-        
+
+        try:
+            mo_float = float(getattr(m, "minutes_after_open", 999))
+            if math.isnan(mo_float):
+                mo_float = 999.0
+            minutes_after_open = int(mo_float)
+        except (TypeError, ValueError):
+            minutes_after_open = 999
+
+        if 150 <= minutes_after_open < 180:
+            risk_multiplier = 1.3
+        elif 240 <= minutes_after_open < 300:
+            risk_multiplier = 1.0
+        elif 300 <= minutes_after_open <= 390:
+            risk_multiplier = 1.1
+        else:
+            risk_multiplier = 0.8
+
+        base_max_risk_points = 7.5
+        max_risk_points = base_max_risk_points * risk_multiplier
+
         quantity = self.calculate_quantity(risk)
-        
-        max_risk_points = 7.5
+
         if risk > max_risk_points:
             return self.hold(
                 "RISK_FILTER",
-                f"Blocked: stop too wide. Risk={risk:.2f} points"
+                f"Blocked: stop too wide. Risk={risk:.2f} points (max {max_risk_points:.2f})",
             )
 
         if risk <= 0:

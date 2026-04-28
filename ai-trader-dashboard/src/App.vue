@@ -46,6 +46,20 @@ const formatMoney = (value) =>
     maximumFractionDigits: 2,
   });
 
+/** M/d/Y HH:mm:ss (local time) */
+const formatTimestamp = (value) => {
+  if (value == null || value === "") return "";
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return String(value);
+  const M = d.getMonth() + 1;
+  const dDay = d.getDate();
+  const Y = d.getFullYear();
+  const HH = String(d.getHours()).padStart(2, "0");
+  const mm = String(d.getMinutes()).padStart(2, "0");
+  const ss = String(d.getSeconds()).padStart(2, "0");
+  return `${M}/${dDay}/${Y} ${HH}:${mm}:${ss}`;
+};
+
 const chartOptions = computed(() => {
   const curve = equityCurve.value;
   return {
@@ -143,7 +157,7 @@ onMounted(fetchSummary);
       </div>
 
       <div class="panel">
-        <h2>Equity Curve</h2>
+        <h2 class="section-title">Equity Curve</h2>
 
         <div class="chart-wrap">
           <Line :data="chartData" :options="chartOptions" />
@@ -151,7 +165,7 @@ onMounted(fetchSummary);
       </div>
 
       <div class="panel">
-        <h2>Recent Trades</h2>
+        <h2 class="section-title">Recent Trades</h2>
 
         <table>
           <thead>
@@ -167,7 +181,7 @@ onMounted(fetchSummary);
 
           <tbody>
             <tr v-for="trade in summary.recent_trades" :key="trade.id">
-              <td>{{ trade.timestamp }}</td>
+              <td>{{ formatTimestamp(trade.timestamp) }}</td>
               <td>{{ trade.symbol }}</td>
               <td>{{ trade.action }}</td>
               <td>{{ trade.entry_price }}</td>
@@ -216,6 +230,10 @@ onMounted(fetchSummary);
 
 .panel {
   margin-top: 24px;
+}
+
+.section-title {
+  color: black;
 }
 
 .chart-wrap {
