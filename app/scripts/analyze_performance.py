@@ -5,10 +5,10 @@ import pandas as pd
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DB_FILE = PROJECT_ROOT / "trades.db"
 DB_PATH = f"sqlite:///{DB_FILE}"
-MES_POINT_VALUE = 5.0
+POINT_VALUE = 5.0 # ES $50 per point
 
 
-def calculate_pnl(action, entry, exit_price, quantity):
+def calculate_pnl(action, entry, exit_price, quantity=1):
     if action == "BUY":
         return (exit_price - entry) * POINT_VALUE * quantity
 

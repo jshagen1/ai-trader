@@ -28,11 +28,19 @@ class DecisionEngine:
 
         if market.atr <= 0:
             return self.hold("ATR_FILTER", "Invalid ATR")
+        
+        if market.trend_score < 0.65:
+            return self.hold(
+                "TREND_FILTER",
+                f"Blocked: trend score too weak ({market.trend_score:.2f})"
+            )
 
         return self.orb_breakout(market)
 
     def orb_breakout(self, m) -> TradeSignal:
         risk = m.atr * 1.25
+        
+        quantity = self.calculate_quantity(risk)
         
         max_risk_points = 7.5
         if risk > max_risk_points:
@@ -57,7 +65,7 @@ class DecisionEngine:
         if m.trend_score >= 0.7:
             long_score += 0.20
 
-        if m.avg_volume and m.volume > m.avg_volume * 1.15:
+        if m.avg_volume and m.volume > m.avg_volume * 1.20:
             long_score += 0.15
 
         if 55 <= m.rsi <= 72:
@@ -77,7 +85,7 @@ class DecisionEngine:
         if m.trend_score >= 0.7:
             short_score += 0.20
 
-        if m.avg_volume and m.volume > m.avg_volume * 1.15:
+        if m.avg_volume and m.volume > m.avg_volume * 1.20:
             short_score += 0.15
 
         if 28 <= m.rsi <= 45:
@@ -94,7 +102,8 @@ class DecisionEngine:
                 entry=m.price,
                 stop_loss=m.price - risk,
                 take_profit=m.price + risk * 2.0,
-                reason=f"ORB long score {long_score:.2f}, ML probability {ml_prob:.2f}",
+                quantity=quantity,
+                reason=f"ORB long score {long_score:.2f}, ML probability {ml_prob:.2f}, qty {quantity}",
             )
 
         if short_score >= 0.70 and ml_prob <= 0.45:
@@ -105,7 +114,8 @@ class DecisionEngine:
                 entry=m.price,
                 stop_loss=m.price + risk,
                 take_profit=m.price - risk * 2.0,
-                reason=f"ORB short score {short_score:.2f}, ML probability {ml_prob:.2f}",
+                quantity=quantity,
+                reason=f"ORB short score {short_score:.2f}, ML probability {ml_prob:.2f}, qty {quantity}",
             )
 
         return TradeSignal(
@@ -224,3 +234,11 @@ class DecisionEngine:
             take_profit=None,
             reason=reason,
         )
+        
+    def calculate_quantity(self, risk_points, point_value=50.0, max_risk_dollars=100.0, max_contracts=3):
+        if risk_points <= 0:
+            return 1
+
+        quantity = int(max_risk_dollars / (risk_points * point_value))
+
+        return max(1, min(quantity, max_contracts))

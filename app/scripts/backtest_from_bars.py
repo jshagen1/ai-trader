@@ -181,7 +181,7 @@ def main():
         if signal.action not in ["BUY", "SELL"]:
             continue
 
-        quantity = 1
+        quantity = getattr(signal, "quantity", 1) or 1
 
         exit_price, exit_reason, exit_time = simulate_exit(bars, i, signal)
         pnl = calculate_pnl(signal.action, signal.entry, exit_price, quantity)
