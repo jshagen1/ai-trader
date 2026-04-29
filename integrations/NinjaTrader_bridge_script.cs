@@ -48,6 +48,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                 ExitOnSessionCloseSeconds = 30;
 
                 IncludeCommission = true;
+
+                // Prevent strategy from terminating automatically on rejected orders.
+                // Bad orders are now blocked before submission.
+                RealtimeErrorHandling = RealtimeErrorHandling.IgnoreAllErrors;
             }
 
             if (State == State.Configure)
@@ -108,7 +112,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             double safeOrbLow = orbLow > 0 ? orbLow : price;
 
             DateTime openTime = new DateTime(Time[0].Year, Time[0].Month, Time[0].Day, 8, 30, 0);
-            int minutesAfterOpen = (int)(Time[0] - openTime).TotalMinutes;
+            int minutesAfterOpen = Math.Max(0, (int)(Time[0] - openTime).TotalMinutes);
 
             double trendScore = 0.0;
 
@@ -167,25 +171,84 @@ namespace NinjaTrader.NinjaScript.Strategies
 
                 Print("Signal response: " + result);
 
-                if (Position.MarketPosition != MarketPosition.Flat || !orbComplete)
+                if (string.IsNullOrWhiteSpace(result))
+                {
+                    Print("Signal blocked: empty API response.");
                     return;
+                }
 
-                string action = ExtractString(result, "action");
+                if (!response.IsSuccessStatusCode)
+                {
+                    Print("Signal blocked: API returned status " + response.StatusCode);
+                    return;
+                }
+
+                if (Position == null)
+                {
+                    Print("Signal ignored: Position object is null.");
+                    return;
+                }
+
+                if (Position.MarketPosition != MarketPosition.Flat)
+                {
+                    Print("Signal ignored: already in position.");
+                    return;
+                }
+
+                if (!orbComplete)
+                {
+                    Print("Signal ignored: ORB not complete.");
+                    return;
+                }
+
+                string action = ExtractString(result, "action").ToUpperInvariant();
+                string reason = ExtractString(result, "reason");
+
+                if (string.IsNullOrEmpty(action))
+                {
+                    Print("Signal blocked: missing action.");
+                    return;
+                }
+
+                if (action == "HOLD")
+                {
+                    Print("Signal HOLD: " + reason);
+                    return;
+                }
+
+                if (action != "BUY" && action != "SELL")
+                {
+                    Print("Signal blocked: unknown action: " + action);
+                    Print("Reason: " + reason);
+                    return;
+                }
+
                 double stopLoss = ExtractNullableDouble(result, "stop_loss");
                 double takeProfit = ExtractNullableDouble(result, "take_profit");
 
+                if (stopLoss <= 0 || takeProfit <= 0)
+                {
+                    Print(action + " blocked: missing stop_loss or take_profit.");
+                    Print("Reason: " + reason);
+                    return;
+                }
+
+                double currentPrice = Close[0];
+
+                Print("ORDER CHECK | Action: " + action
+                    + " | Current: " + currentPrice
+                    + " | Stop: " + stopLoss
+                    + " | Target: " + takeProfit);
+
+                if (!IsValidOrderPrices(action, currentPrice, stopLoss, takeProfit))
+                    return;
+
+                activeStopLoss = stopLoss;
+                initialStopLoss = stopLoss;
+                activeTakeProfit = takeProfit;
+
                 if (action == "BUY")
                 {
-                    if (stopLoss <= 0 || takeProfit <= 0)
-                    {
-                        Print("BUY blocked: missing stop_loss or take_profit.");
-                        return;
-                    }
-
-                    activeStopLoss = stopLoss;
-                    initialStopLoss = stopLoss;
-                    activeTakeProfit = takeProfit;
-
                     Print("Submitting BUY | Stop: " + activeStopLoss + " | Target: " + activeTakeProfit);
 
                     SetStopLoss("AI_LONG", CalculationMode.Price, activeStopLoss, false);
@@ -195,16 +258,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
                 else if (action == "SELL")
                 {
-                    if (stopLoss <= 0 || takeProfit <= 0)
-                    {
-                        Print("SELL blocked: missing stop_loss or take_profit.");
-                        return;
-                    }
-
-                    activeStopLoss = stopLoss;
-                    initialStopLoss = stopLoss;
-                    activeTakeProfit = takeProfit;
-
                     Print("Submitting SELL | Stop: " + activeStopLoss + " | Target: " + activeTakeProfit);
 
                     SetStopLoss("AI_SHORT", CalculationMode.Price, activeStopLoss, false);
@@ -224,76 +277,117 @@ namespace NinjaTrader.NinjaScript.Strategies
         }
 
         protected override void OnExecutionUpdate(
-		    Execution execution,
-		    string executionId,
-		    double price,
-		    int quantity,
-		    MarketPosition marketPosition,
-		    string orderId,
-		    DateTime time)
-		{
-		    if (execution == null || execution.Order == null)
-		        return;
-		
-		    if (execution.Order.OrderState != OrderState.Filled)
-		        return;
-		
-		    string orderName = execution.Order.Name;
-		
-		    Print("EXECUTION DEBUG:");
-		    Print("Order name: " + orderName);
-		    Print("Execution price: " + price);
-		    Print("Quantity: " + quantity);
-		    Print("MarketPosition param: " + marketPosition);
-		    Print("Strategy Position: " + Position.MarketPosition);
-		
-		    if (orderName == "AI_LONG")
-		    {
-		        entryPrice = price;
-		        positionSize = quantity;
-		        lastAction = "BUY";
-		
-		        Print("ENTRY FILLED: BUY @ " + entryPrice);
-		        return;
-		    }
-		
-		    if (orderName == "AI_SHORT")
-		    {
-		        entryPrice = price;
-		        positionSize = quantity;
-		        lastAction = "SELL";
-		
-		        Print("ENTRY FILLED: SELL @ " + entryPrice);
-		        return;
-		    }
-		
-		    if (positionSize > 0 && entryPrice > 0 && lastAction != "")
-		    {
-		        exitPrice = price;
-		
-		        double pnl = 0;
-		
-		        if (lastAction == "BUY")
-		            pnl = (exitPrice - entryPrice) * 5.0 * positionSize;
-		
-		        if (lastAction == "SELL")
-		            pnl = (entryPrice - exitPrice) * 5.0 * positionSize;
-		
-		        Print("EXIT FILLED via " + orderName + " @ " + exitPrice + " | PnL: " + pnl);
-		
-		        SendTradeToAPI(entryPrice, exitPrice, pnl, lastAction, positionSize, time);
-		
-		        positionSize = 0;
-		        entryPrice = 0;
-		        exitPrice = 0;
-		        lastAction = "";
-		
-		        activeStopLoss = 0;
-		        activeTakeProfit = 0;
-		        initialStopLoss = 0;
-		        lastManageCall = Core.Globals.MinDate;
-		    }
-		}
+            Execution execution,
+            string executionId,
+            double price,
+            int quantity,
+            MarketPosition marketPosition,
+            string orderId,
+            DateTime time)
+        {
+            if (execution == null || execution.Order == null)
+                return;
+
+            if (execution.Order.OrderState != OrderState.Filled)
+                return;
+
+            string orderName = execution.Order.Name;
+
+            Print("EXECUTION DEBUG:");
+            Print("Order name: " + orderName);
+            Print("Execution price: " + price);
+            Print("Quantity: " + quantity);
+            Print("MarketPosition param: " + marketPosition);
+            Print("Strategy Position: " + Position.MarketPosition);
+
+            if (orderName == "AI_LONG")
+            {
+                entryPrice = price;
+                positionSize = quantity;
+                lastAction = "BUY";
+
+                Print("ENTRY FILLED: BUY @ " + entryPrice);
+                return;
+            }
+
+            if (orderName == "AI_SHORT")
+            {
+                entryPrice = price;
+                positionSize = quantity;
+                lastAction = "SELL";
+
+                Print("ENTRY FILLED: SELL @ " + entryPrice);
+                return;
+            }
+
+            if (positionSize > 0 && entryPrice > 0 && lastAction != "")
+            {
+                exitPrice = price;
+
+                double pnl = 0;
+
+                if (lastAction == "BUY")
+                    pnl = (exitPrice - entryPrice) * 5.0 * positionSize;
+
+                if (lastAction == "SELL")
+                    pnl = (entryPrice - exitPrice) * 5.0 * positionSize;
+
+                Print("EXIT FILLED via " + orderName + " @ " + exitPrice + " | PnL: " + pnl);
+
+                SendTradeToAPI(entryPrice, exitPrice, pnl, lastAction, positionSize, time);
+
+                positionSize = 0;
+                entryPrice = 0;
+                exitPrice = 0;
+                lastAction = "";
+
+                activeStopLoss = 0;
+                activeTakeProfit = 0;
+                initialStopLoss = 0;
+                lastManageCall = Core.Globals.MinDate;
+            }
+        }
+
+        private bool IsValidOrderPrices(string action, double currentPrice, double stopLoss, double takeProfit)
+        {
+            if (currentPrice <= 0)
+            {
+                Print("Order blocked: current price is invalid.");
+                return false;
+            }
+
+            if (action == "BUY")
+            {
+                if (stopLoss >= currentPrice)
+                {
+                    Print("BUY blocked: stop_loss must be below current price.");
+                    return false;
+                }
+
+                if (takeProfit <= currentPrice)
+                {
+                    Print("BUY blocked: take_profit must be above current price.");
+                    return false;
+                }
+            }
+
+            if (action == "SELL")
+            {
+                if (stopLoss <= currentPrice)
+                {
+                    Print("SELL blocked: stop_loss must be above current price.");
+                    return false;
+                }
+
+                if (takeProfit >= currentPrice)
+                {
+                    Print("SELL blocked: take_profit must be below current price.");
+                    return false;
+                }
+            }
+
+            return true;
+        }
 
         private async System.Threading.Tasks.Task ManageOpenPosition(double currentPrice, double atrValue)
         {
@@ -327,7 +421,19 @@ namespace NinjaTrader.NinjaScript.Strategies
 
                 Print("Manage response: " + result);
 
-                string updateAction = ExtractString(result, "action");
+                if (string.IsNullOrWhiteSpace(result))
+                {
+                    Print("Manage ignored: empty API response.");
+                    return;
+                }
+
+                if (!response.IsSuccessStatusCode)
+                {
+                    Print("Manage ignored: API returned status " + response.StatusCode);
+                    return;
+                }
+
+                string updateAction = ExtractString(result, "action").ToUpperInvariant();
                 double newStopLoss = ExtractNullableDouble(result, "new_stop_loss");
 
                 if (updateAction != "UPDATE_STOP" || newStopLoss <= 0)
@@ -386,6 +492,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                 var result = await response.Content.ReadAsStringAsync();
 
                 Print("Trade logged: " + result);
+
+                if (!response.IsSuccessStatusCode)
+                    Print("Trade log API status: " + response.StatusCode);
             }
             catch (Exception ex)
             {
@@ -396,12 +505,18 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         private string ExtractString(string json, string key)
         {
+            if (string.IsNullOrWhiteSpace(json) || string.IsNullOrWhiteSpace(key))
+                return "";
+
             Match match = Regex.Match(json, "\"" + key + "\"\\s*:\\s*\"([^\"]*)\"");
             return match.Success ? match.Groups[1].Value : "";
         }
 
         private double ExtractNullableDouble(string json, string key)
         {
+            if (string.IsNullOrWhiteSpace(json) || string.IsNullOrWhiteSpace(key))
+                return 0;
+
             Match match = Regex.Match(json, "\"" + key + "\"\\s*:\\s*(null|-?\\d+(\\.\\d+)?)");
 
             if (!match.Success || match.Groups[1].Value == "null")

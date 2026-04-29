@@ -34,7 +34,7 @@ DB_FILE: Path = default_trades_db_path()
 
 
 def _bar_calendar_dates(timestamps: pd.Series) -> pd.Series:
-    """Calendar date for --today: naive = stored wall date; aware = machine-local date."""
+    """Calendar date for --today / --history (naive = wall date; aware = local date)."""
     try:
         ts = pd.to_datetime(timestamps, format="mixed", errors="coerce")
     except TypeError:
@@ -214,7 +214,7 @@ def analyze_results(trades: list[dict[str, Any]]) -> None:
     print(f"\nSaved: {out}")
 
 
-def main(*, today: bool = False) -> None:
+def main(*, today: bool = False, history: bool = False) -> None:
     engine: Engine = create_engine(f"sqlite:///{DB_FILE}")
     decision_engine = DecisionEngine()
 
@@ -240,6 +240,15 @@ def main(*, today: bool = False) -> None:
         print(f"Filtered to local date {today_local}: {len(bars)} bars")
         if bars.empty:
             print("No bars for today.")
+            return
+
+    if history:
+        today_local = date.today()
+        mask = _bar_calendar_dates(bars["timestamp"]) != today_local
+        bars = bars.loc[mask].reset_index(drop=True)
+        print(f"Excluded local date {today_local}: {len(bars)} bars")
+        if bars.empty:
+            print("No bars after excluding today.")
             return
 
     print(f"Loaded {len(bars)} bars")
@@ -315,10 +324,16 @@ def main(*, today: bool = False) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Backtest from market_bars SQLite.")
-    parser.add_argument(
+    when = parser.add_mutually_exclusive_group()
+    when.add_argument(
         "--today",
         action="store_true",
         help="Only backtest bars from the current local date.",
     )
+    when.add_argument(
+        "--history",
+        action="store_true",
+        help="Exclude bars from the current local date (prior days only).",
+    )
     args = parser.parse_args()
-    main(today=args.today)
+    main(today=args.today, history=args.history)
