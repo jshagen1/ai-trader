@@ -25,4 +25,5 @@ def bar_dict_from_orm(row: MarketBar) -> dict[str, Any]:
         "orb_low": row.orb_low,
         "trend_score": row.trend_score,
         "chop_score": row.chop_score,
+        "minutes_after_open": row.minutes_after_open,
     }

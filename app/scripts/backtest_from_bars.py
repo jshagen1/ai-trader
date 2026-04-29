@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import argparse
+from datetime import date, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -14,7 +16,6 @@ from app.constants import (
     BACKTEST_MAX_LOOKAHEAD_BARS,
     BACKTEST_RECENT_BARS_WINDOW,
     BACKTEST_SKIP_BARS_AFTER_TRADE,
-    MINUTES_AFTER_OPEN_INVALID_SENTINEL,
     POINT_VALUE,
 )
 from app.decision_engine import DecisionEngine
@@ -30,6 +31,20 @@ from app.time_buckets import time_bucket_label
 
 
 DB_FILE: Path = default_trades_db_path()
+
+
+def _bar_calendar_dates(timestamps: pd.Series) -> pd.Series:
+    """Calendar date for --today: naive = stored wall date; aware = machine-local date."""
+    try:
+        ts = pd.to_datetime(timestamps, format="mixed", errors="coerce")
+    except TypeError:
+        ts = timestamps.map(lambda x: pd.to_datetime(x, errors="coerce"))
+    if getattr(ts.dtype, "tz", None) is None:
+        return ts.dt.normalize().dt.date
+    local_tz = datetime.now().astimezone().tzinfo
+    if local_tz is None:
+        return ts.dt.normalize().dt.date
+    return ts.dt.tz_convert(local_tz).dt.date
 
 
 def to_market_state(row: Any) -> SimpleNamespace:
@@ -51,9 +66,7 @@ def to_market_state(row: Any) -> SimpleNamespace:
         trend_score=row["trend_score"],
         chop_score=row["chop_score"],
         position=PositionStatus.FLAT.value,
-        minutes_after_open=row.get(
-            "minutes_after_open", MINUTES_AFTER_OPEN_INVALID_SENTINEL
-        ),
+        minutes_after_open=int(row["minutes_after_open"]),
     )
 
 
@@ -201,7 +214,7 @@ def analyze_results(trades: list[dict[str, Any]]) -> None:
     print(f"\nSaved: {out}")
 
 
-def main() -> None:
+def main(*, today: bool = False) -> None:
     engine: Engine = create_engine(f"sqlite:///{DB_FILE}")
     decision_engine = DecisionEngine()
 
@@ -219,8 +232,15 @@ def main() -> None:
         "vwap", "atr", "rsi", "orb_high", "orb_low",
         "trend_score", "chop_score",
     ]).reset_index(drop=True)
-    
-    bars = bars.dropna(subset=["minutes_after_open"]).reset_index(drop=True)
+
+    if today:
+        today_local = date.today()
+        mask = _bar_calendar_dates(bars["timestamp"]) == today_local
+        bars = bars.loc[mask].reset_index(drop=True)
+        print(f"Filtered to local date {today_local}: {len(bars)} bars")
+        if bars.empty:
+            print("No bars for today.")
+            return
 
     print(f"Loaded {len(bars)} bars")
     print("Starting backtest...")
@@ -282,9 +302,7 @@ def main() -> None:
             "slippage_points": slippage_points,
             "slippage_dollars": slippage_dollars,
             "minutes_after_open": market.minutes_after_open,
-            "time_bucket": time_bucket_label(
-                getattr(market, "minutes_after_open", None)
-            ),
+            "time_bucket": time_bucket_label(market.minutes_after_open),
             "reason": signal.reason,
         }
 
@@ -296,4 +314,11 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Backtest from market_bars SQLite.")
+    parser.add_argument(
+        "--today",
+        action="store_true",
+        help="Only backtest bars from the current local date.",
+    )
+    args = parser.parse_args()
+    main(today=args.today)

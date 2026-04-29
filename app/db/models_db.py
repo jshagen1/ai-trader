@@ -66,3 +66,4 @@ class MarketBar(Base):
     orb_low: Mapped[float | None] = mapped_column(Float, nullable=True)
     trend_score: Mapped[float | None] = mapped_column(Float, nullable=True)
     chop_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    minutes_after_open: Mapped[int] = mapped_column(Integer, nullable=False)

@@ -106,6 +106,7 @@ def get_signal(market: MarketState) -> TradeSignal:
             orb_low=market.orb_low,
             trend_score=market.trend_score,
             chop_score=market.chop_score,
+            minutes_after_open=market.minutes_after_open,
         )
 
         db.add(bar)
