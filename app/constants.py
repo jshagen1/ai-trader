@@ -42,6 +42,9 @@ SESSION_WEAK_MID_A_END = 150
 SESSION_WEAK_MID_B_START = 180
 SESSION_WEAK_MID_B_END = 240
 
+# ORB: no new entries at or after this many minutes after the open (e.g. late session).
+SESSION_ORB_NO_ENTRY_MINUTES_AFTER_OPEN = 390
+
 # --- Decision filters ---
 CHOP_SCORE_MAX = 0.55
 TREND_SCORE_MIN = 0.65

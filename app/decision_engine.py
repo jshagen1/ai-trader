@@ -48,6 +48,7 @@ from app.constants import (
     SESSION_WEAK_MID_A_START,
     SESSION_WEAK_MID_B_END,
     SESSION_WEAK_MID_B_START,
+    SESSION_ORB_NO_ENTRY_MINUTES_AFTER_OPEN,
     SESSION_WEAK_OPENING_END,
     SESSION_WEAK_OPENING_START,
     STRATEGY_ORB_ATR_MULTIPLIER,
@@ -90,6 +91,13 @@ class DecisionEngine:
 
         if market.position != PositionStatus.FLAT.value:
             return self.hold(HoldStrategy.POSITION_FILTER, "Already in position")
+
+        if minutes_after_open >= SESSION_ORB_NO_ENTRY_MINUTES_AFTER_OPEN:
+            return self.hold(
+                HoldStrategy.TIME_FILTER,
+                f"No ORB entries at or after {SESSION_ORB_NO_ENTRY_MINUTES_AFTER_OPEN} "
+                f"min after open (now {minutes_after_open})",
+            )
 
         if SESSION_WEAK_OPENING_START <= minutes_after_open < SESSION_WEAK_OPENING_END:
             return self.hold(

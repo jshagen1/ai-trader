@@ -17,16 +17,22 @@ from app.constants import (
     RECENT_BARS_QUERY_LIMIT_DEFAULT,
 )
 from app.decision_engine import DecisionEngine
+from app.decision_engine_v2 import DecisionEngineV2
 from app.db.database import Base
 from app.db.database import SessionLocal
 from app.db.database import engine
 from app.db.models_db import CompletedTrade, MarketBar, TradeLog
 from app.models.market_state import MarketState
 from app.models.trade_signal import TradeSignal
+from app.riley_signal_adapter import (
+    build_riley_decision_request,
+    riley_response_to_trade_signal,
+)
 from app.slippage import trade_slippage_points_and_dollars
 
 app = FastAPI()
 decision_engine = DecisionEngine()
+decision_engine_v2 = DecisionEngineV2()
 
 Base.metadata.create_all(bind=engine)
 
@@ -107,6 +113,72 @@ def get_signal(market: MarketState) -> TradeSignal:
             trend_score=market.trend_score,
             chop_score=market.chop_score,
             minutes_after_open=market.minutes_after_open,
+        )
+
+        db.add(bar)
+        db.commit()
+
+        recent_bars = decision_engine.get_recent_bars(
+            db, market.symbol, limit=RECENT_BARS_QUERY_LIMIT_DEFAULT
+        )
+
+        # Use Riley decision engine for early sessions.
+        if market.minutes_after_open < decision_engine_v2.config.max_minutes_after_open:
+            riley_req = build_riley_decision_request(market, recent_bars)
+            riley_resp = decision_engine_v2.decide(riley_req)
+            signal = riley_response_to_trade_signal(market, riley_resp)
+        else:
+            signal = decision_engine.decide(market, recent_bars)
+
+        log = TradeLog(
+            timestamp=market.timestamp,
+            symbol=market.symbol,
+            price=market.price,
+            vwap=market.vwap,
+            atr=market.atr,
+            rsi=market.rsi,
+            orb_high=market.orb_high,
+            orb_low=market.orb_low,
+            volume=market.volume,
+            avg_volume=market.avg_volume,
+            trend_score=market.trend_score,
+            chop_score=market.chop_score,
+            action=signal.action,
+            strategy=signal.strategy,
+            confidence=signal.confidence,
+            reason=signal.reason,
+        )
+
+        db.add(log)
+        db.commit()
+
+        return signal
+
+    finally:
+        db.close()
+
+
+@app.post("/signal-v2", response_model=TradeSignal)
+def get_signal_v2(market: MarketState) -> TradeSignal:
+    db: Session = SessionLocal()
+
+    try:
+        bar = MarketBar(
+            timestamp=market.timestamp,
+            symbol=market.symbol,
+            open=market.open,
+            high=market.high,
+            low=market.low,
+            close=market.close,
+            volume=market.volume,
+            avg_volume=market.avg_volume,
+            vwap=market.vwap,
+            atr=market.atr,
+            rsi=market.rsi,
+            orb_high=market.orb_high,
+            orb_low=market.orb_low,
+            trend_score=market.trend_score,
+            chop_score=market.chop_score,
         )
 
         db.add(bar)

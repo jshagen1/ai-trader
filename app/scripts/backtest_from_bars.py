@@ -19,8 +19,15 @@ from app.constants import (
     POINT_VALUE,
 )
 from app.decision_engine import DecisionEngine
+from app.decision_engine_v2 import DecisionEngineV2
 from app.enums import Action, ExitReason, PositionStatus
+from app.models.riley.models import RileyDecisionRequest
 from app.paths import PROJECT_ROOT, default_trades_db_path
+from app.riley_signal_adapter import (
+    bar_series_to_candle,
+    build_riley_decision_request_from_candles,
+    riley_response_to_trade_signal,
+)
 from app.pnl import calculate_pnl
 from app.slippage import (
     apply_entry_slippage,
@@ -45,6 +52,45 @@ def _bar_calendar_dates(timestamps: pd.Series) -> pd.Series:
     if local_tz is None:
         return ts.dt.normalize().dt.date
     return ts.dt.tz_convert(local_tz).dt.date
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Backtest using market_bars from SQLite.",
+    )
+    when = parser.add_mutually_exclusive_group()
+    when.add_argument(
+        "--today",
+        action="store_true",
+        help="Only backtest bars from the current local date.",
+    )
+    when.add_argument(
+        "--history",
+        action="store_true",
+        help="Exclude bars from the current local date (prior days only).",
+    )
+    parser.add_argument(
+        "strategy",
+        nargs="?",
+        default="auto",
+        choices=("auto", "v1", "v2"),
+        help=(
+            "auto: Riley if minutes_after_open < RileyConfig.max_minutes_after_open, "
+            "else ORB (same as POST /signal). v1: ORB only. v2: Riley only. Default: auto."
+        ),
+    )
+    return parser.parse_args(argv)
+
+
+def build_riley_request(market: Any, bars: pd.DataFrame, index: int) -> RileyDecisionRequest:
+    """
+    Build the Riley v2 request: candle window ending at the current bar, plus
+    context fields used by risk / volatility scoring and pattern detectors.
+    """
+    start = max(0, index - BACKTEST_RECENT_BARS_WINDOW)
+    chunk = bars.iloc[start : index + 1]
+    candles = [bar_series_to_candle(row) for _, row in chunk.iterrows()]
+    return build_riley_decision_request_from_candles(market, candles)
 
 
 def to_market_state(row: Any) -> SimpleNamespace:
@@ -149,7 +195,7 @@ def analyze_results(trades: list[dict[str, Any]]) -> None:
         print(f"Trades: {len(df_without_top2)}")
         print(f"Net PnL: ${df_without_top2['pnl'].sum():.2f}")
         print(f"Profit Factor: {profit_factor_top2:.2f}")
-        
+
         if "slippage_dollars" in df_without_top2.columns:
             print(f"Slippage: ${df_without_top2['slippage_dollars'].sum():.2f}")
 
@@ -187,7 +233,7 @@ def analyze_results(trades: list[dict[str, Any]]) -> None:
     print(f"Expectancy: ${expectancy:.2f}")
     print(f"Profit Factor: {profit_factor:.2f}")
     print(f"Max Drawdown: ${df['drawdown'].min():.2f}")
-    
+
     if "slippage_dollars" in df.columns:
         print("\nSlippage Summary")
         print("----------------")
@@ -201,7 +247,7 @@ def analyze_results(trades: list[dict[str, Any]]) -> None:
     print("\nBy Strategy")
     print("-----------")
     print(df.groupby("strategy")["pnl"].agg(["count", "sum", "mean", "min", "max"]))
-    
+
     print("\nBy Time Bucket")
     print("--------------")
     print(
@@ -214,9 +260,15 @@ def analyze_results(trades: list[dict[str, Any]]) -> None:
     print(f"\nSaved: {out}")
 
 
-def main(*, today: bool = False, history: bool = False) -> None:
+def main(
+    *,
+    strategy: str = "auto",
+    today: bool = False,
+    history: bool = False,
+) -> None:
     engine: Engine = create_engine(f"sqlite:///{DB_FILE}")
-    decision_engine = DecisionEngine()
+    decision_engine_v1 = DecisionEngine()
+    decision_engine_v2 = DecisionEngineV2()
 
     bars = pd.read_sql(
         "SELECT * FROM market_bars ORDER BY timestamp ASC",
@@ -251,7 +303,14 @@ def main(*, today: bool = False, history: bool = False) -> None:
             print("No bars after excluding today.")
             return
 
+    riley_max = decision_engine_v2.config.max_minutes_after_open
     print(f"Loaded {len(bars)} bars")
+    if strategy == "auto":
+        print(
+            f"Strategy: auto (Riley if minutes_after_open < {riley_max}, else ORB)",
+        )
+    else:
+        print(f"Strategy: {strategy} (forced)")
     print("Starting backtest...")
 
     trades = []
@@ -269,7 +328,18 @@ def main(*, today: bool = False, history: bool = False) -> None:
         )
         market = to_market_state(bars.iloc[i])
 
-        signal = decision_engine.decide(market, recent_bars)
+        if strategy == "v1":
+            signal = decision_engine_v1.decide(market, recent_bars)
+        elif strategy == "v2":
+            request = build_riley_request(market, bars, i)
+            riley_resp = decision_engine_v2.decide(request)
+            signal = riley_response_to_trade_signal(market, riley_resp)
+        elif market.minutes_after_open < riley_max:
+            request = build_riley_request(market, bars, i)
+            riley_resp = decision_engine_v2.decide(request)
+            signal = riley_response_to_trade_signal(market, riley_resp)
+        else:
+            signal = decision_engine_v1.decide(market, recent_bars)
 
         if signal.action not in (Action.BUY.value, Action.SELL.value):
             continue
@@ -277,7 +347,7 @@ def main(*, today: bool = False, history: bool = False) -> None:
         quantity = getattr(signal, "quantity", 1) or 1
 
         exit_price, exit_reason, exit_time = simulate_exit(bars, i, signal)
-        
+
         slipped_entry = apply_entry_slippage(signal.action, signal.entry)
         slipped_exit = apply_exit_slippage(signal.action, exit_price)
 
@@ -323,17 +393,9 @@ def main(*, today: bool = False, history: bool = False) -> None:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Backtest from market_bars SQLite.")
-    when = parser.add_mutually_exclusive_group()
-    when.add_argument(
-        "--today",
-        action="store_true",
-        help="Only backtest bars from the current local date.",
+    _args = parse_args()
+    main(
+        strategy=_args.strategy,
+        today=_args.today,
+        history=_args.history,
     )
-    when.add_argument(
-        "--history",
-        action="store_true",
-        help="Exclude bars from the current local date (prior days only).",
-    )
-    args = parser.parse_args()
-    main(today=args.today, history=args.history)

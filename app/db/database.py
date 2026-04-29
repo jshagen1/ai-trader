@@ -4,8 +4,10 @@ from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
+from app.paths import default_trades_db_path
 
-DATABASE_URL = "sqlite:///./trades.db"
+_db_file = default_trades_db_path().resolve()
+DATABASE_URL = f"sqlite:///{_db_file.as_posix()}"
 
 
 class Base(DeclarativeBase):
