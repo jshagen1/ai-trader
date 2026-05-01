@@ -4,5 +4,4 @@ node_modules
 __pycache__/
 *.py[cod]
 *$py.class
-*.db
 backtest_results.csv
