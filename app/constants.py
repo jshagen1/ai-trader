@@ -64,6 +64,21 @@ STRATEGY_ORB_REWARD_RISK_RATIO = 2.0
 # stop is hit before the move takes off.
 ORB_ENTRY_MAX_WICK_ATR = 2.0
 
+# How far below the ORB high (for longs) or above the ORB low (for shorts)
+# the bar's close may land and still qualify as an ORB entry. Expressed as
+# a fraction of ATR. A small value (0.15) allows bars that tested the ORB level
+# intrabar and closed within noise distance (≈1-2 ticks), while blocking bars
+# whose close is clearly inside the range. Entries above the ORB high (or below
+# the ORB low) always pass — the tolerance only applies to the below-level side.
+ORB_ENTRY_PROXIMITY_ATR = 0.15
+
+# How many bars back to check for RSI exhaustion. If RSI was above the long
+# upper bound (overbought) or below the short lower bound (oversold) within
+# this window, the move is considered exhausted and the entry is skipped.
+# Catches the pattern where RSI runs to 80+ then drops back into range — that
+# re-entry signals fading momentum, not a fresh breakout.
+ORB_RSI_EXHAUSTION_LOOKBACK = 5
+
 ORB_LONG_SCORE_THRESHOLD = 0.70
 ORB_SHORT_SCORE_THRESHOLD = 0.70
 ORB_LONG_ML_THRESHOLD = 0.55
@@ -118,13 +133,6 @@ HTF_EMA_PERIOD_EARLY = 20   # warmup: 20 + 10 = 30 bars (~30 min after open)
 HTF_EMA_PERIOD = 50         # full: 50 + 10 = 60 bars (~1 hour after open)
 HTF_SLOPE_LOOKBACK = 10     # bars; EMA must be trending this many bars ago
 
-# --- VWAP reversion strategy ---
-VWAP_REVERSION_PULLBACK_LOOKBACK = 5  # bars to scan for the pullback close below VWAP
-VWAP_REVERSION_MAX_DISTANCE_ATR = 0.75  # current price must be within this many ATRs of VWAP
-VWAP_REVERSION_MIN_BODY_RATIO = 0.55   # bounce bar body must be >=55% of its range
-# Upper wick must be <= this fraction of bar range; a large upper wick means price gave back
-# the bounce, signaling weak buyers.
-VWAP_REVERSION_MAX_UPPER_WICK_RATIO = 0.25
 
 # --- Trailing stop (adjust_trailing_stop) ---
 TRAIL_PROFIT_MULTIPLIER_TIER_1 = 1.0

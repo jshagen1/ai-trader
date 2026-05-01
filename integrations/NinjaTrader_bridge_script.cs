@@ -199,9 +199,6 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (Math.Abs(SMA(20)[0] - SMA(50)[0]) < atrValue * 0.2)
                 chopScore += 0.3;
 
-            if (Position.MarketPosition != MarketPosition.Flat)
-                await ManageOpenPosition(price, atrValue);
-
             if (tradingDisabledForDay)
                 return;
 
@@ -255,8 +252,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                     return;
                 }
 
+                // Bar data is now recorded. Kick off position management as fire-and-forget
+                // so its HTTP round-trip cannot block the signal-response path on future bars.
                 if (Position.MarketPosition != MarketPosition.Flat)
                 {
+                    _ = ManageOpenPosition(price, atrValue);
                     Print("Signal ignored: already in position.");
                     return;
                 }

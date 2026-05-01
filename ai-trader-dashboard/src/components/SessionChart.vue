@@ -39,6 +39,18 @@ ChartJS.register(
   zoomPlugin,
 );
 
+// v0.2.1 of chartjs-chart-financial uses backgroundColors/borderColors (plural).
+CandlestickElement.defaults.backgroundColors = {
+  up: "#26c265",
+  down: "#ef4444",
+  unchanged: "#666",
+};
+CandlestickElement.defaults.borderColors = {
+  up: "#26c265",
+  down: "#ef4444",
+  unchanged: "#666",
+};
+
 const dates = ref([]);
 const selectedDate = ref(null);
 const bars = ref([]);
@@ -288,12 +300,12 @@ function buildDatasets() {
       label: "Bars",
       type: "candlestick",
       data: candles,
-      color: {
+      backgroundColors: {
         up: THEME.green,
         down: THEME.red,
         unchanged: THEME.unchanged,
       },
-      borderColor: {
+      borderColors: {
         up: THEME.greenBorder,
         down: THEME.redBorder,
         unchanged: THEME.unchanged,
@@ -427,6 +439,75 @@ function buildDatasets() {
   return datasets;
 }
 
+// Module-level coords so the plugin closure avoids Vue reactivity overhead.
+let _crossX = null;
+let _crossY = null;
+
+// Inline (per-chart) plugin — draws crosshair lines at the mouse position.
+// Uses beforeEvent so Chart.js triggers the redraw automatically via args.changed.
+const crosshairPlugin = {
+  id: "crosshairLines",
+  beforeEvent(chart, args) {
+    const { type, x, y } = args.event;
+    if (type === "mousemove") {
+      _crossX = x;
+      _crossY = y;
+      args.changed = true;
+      const hits = chart.getElementsAtEventForMode(
+        args.event.native,
+        "nearest",
+        { intersect: true },
+        false,
+      );
+      chart.canvas.style.cursor = hits.length ? "pointer" : "default";
+    } else if (type === "mouseout") {
+      _crossX = null;
+      _crossY = null;
+      args.changed = true;
+      chart.canvas.style.cursor = "default";
+    } else if (type === "click") {
+      const hits = chart.getElementsAtEventForMode(
+        args.event.native,
+        "nearest",
+        { intersect: true },
+        false,
+      );
+      const active = chart.tooltip._active ?? [];
+      const isSame =
+        hits.length > 0 &&
+        active.length > 0 &&
+        active[0].datasetIndex === hits[0].datasetIndex &&
+        active[0].index === hits[0].index;
+      if (hits.length === 0 || isSame) {
+        chart.tooltip.setActiveElements([], { x: 0, y: 0 });
+      } else {
+        chart.tooltip.setActiveElements(hits, { x, y });
+      }
+      args.changed = true;
+    }
+  },
+  afterDraw(chart) {
+    if (_crossX == null) return;
+    const { ctx, chartArea } = chart;
+    if (!chartArea) return;
+    const { left, right, top, bottom } = chartArea;
+    if (_crossX < left || _crossX > right || _crossY < top || _crossY > bottom) return;
+    ctx.save();
+    ctx.strokeStyle = "rgba(200,200,200,0.30)";
+    ctx.lineWidth = 1;
+    ctx.setLineDash([4, 4]);
+    ctx.beginPath();
+    ctx.moveTo(_crossX, top);
+    ctx.lineTo(_crossX, bottom);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(left, _crossY);
+    ctx.lineTo(right, _crossY);
+    ctx.stroke();
+    ctx.restore();
+  },
+};
+
 function renderChart() {
   if (!canvasRef.value) return;
   if (chartInstance) {
@@ -439,6 +520,7 @@ function renderChart() {
   chartInstance = new ChartJS(canvasRef.value, {
     type: "candlestick",
     data: { datasets },
+    plugins: [crosshairPlugin],
     // Initial barThickness is applied right after creation via
     // applyDynamicBarThickness() so the first paint already shows correctly
     // sized bars for whatever range the chart opens with.
@@ -452,12 +534,12 @@ function renderChart() {
       // teal/pink, which is what shows in the screenshot.
       elements: {
         candlestick: {
-          color: {
+          backgroundColors: {
             up: THEME.green,
             down: THEME.red,
             unchanged: THEME.unchanged,
           },
-          borderColor: {
+          borderColors: {
             up: THEME.greenBorder,
             down: THEME.redBorder,
             unchanged: THEME.unchanged,
@@ -501,6 +583,7 @@ function renderChart() {
           },
         },
         tooltip: {
+          events: [],
           backgroundColor: THEME.panel,
           titleColor: "#fafafa",
           bodyColor: THEME.text,
@@ -513,21 +596,21 @@ function renderChart() {
               const raw = ctx.raw;
               if (ds.type === "candlestick" && raw) {
                 return [
-                  `O: ${raw.o}  H: ${raw.h}  L: ${raw.l}  C: ${raw.c}`,
+                  `O: ${Number(raw.o).toFixed(2)}  H: ${Number(raw.h).toFixed(2)}  L: ${Number(raw.l).toFixed(2)}  C: ${Number(raw.c).toFixed(2)}`,
                 ];
               }
               if (ds.type === "scatter" && raw?._decision) {
                 const d = raw._decision;
                 const lines = [
-                  `${ds.label}: ${raw.y}`,
+                  `${ds.label}: ${Number(raw.y).toFixed(2)}`,
                   `Strategy: ${d.strategy}`,
-                  `Stop: ${d.stop_loss}   Target: ${d.take_profit}`,
+                  `Stop: ${Number(d.stop_loss).toFixed(2)}   Target: ${Number(d.take_profit).toFixed(2)}`,
                   `Reason: ${d.reason}`,
                 ];
-                if (d.exit_reason) lines.push(`Exit: ${d.exit_reason}`);
+                if (d.exit_reason) lines.push(`Exit: ${d.exit_reason} @ ${Number(d.exit_price).toFixed(2)}`);
                 return lines;
               }
-              return `${ds.label}: ${raw?.y ?? raw}`;
+              return `${ds.label}: ${raw?.y != null ? Number(raw.y).toFixed(2) : raw}`;
             },
           },
         },
@@ -622,6 +705,27 @@ function formatDuration(ms) {
   if (h > 0) return `${h}h ${m}m ${s}s`;
   if (m > 0) return `${m}m ${s}s`;
   return `${s}s`;
+}
+
+/** Round a price to 2 decimal places; returns "—" for null/undefined. */
+function fmt2(v) {
+  if (v == null || v === "") return "—";
+  const n = Number(v);
+  return Number.isNaN(n) ? String(v) : n.toFixed(2);
+}
+
+/** MM/DD/YY H:MMam/pm — e.g. 05/01/26 2:42pm */
+function formatDecisionTimestamp(ts) {
+  const d = tsToDate(ts);
+  if (Number.isNaN(d.getTime())) return String(ts);
+  const M = String(d.getMonth() + 1).padStart(2, "0");
+  const D = String(d.getDate()).padStart(2, "0");
+  const Y = String(d.getFullYear()).slice(-2);
+  const h = d.getHours();
+  const mm = String(d.getMinutes()).padStart(2, "0");
+  const ampm = h >= 12 ? "pm" : "am";
+  const h12 = h % 12 === 0 ? 12 : h % 12;
+  return `${M}/${D}/${Y} ${h12}:${mm}${ampm}`;
 }
 
 const sessionStats = computed(() => {
@@ -772,10 +876,12 @@ function renderPnlChart() {
 function resetZoom() {
   if (!chartInstance) return;
   chartInstance.resetZoom();
-  // resetZoom() doesn't fire the zoom plugin's onZoomComplete callback, so the
-  // bars stay at whatever thickness they had while zoomed in. Recompute against
-  // the now-full visible range. RAF gives the scale one frame to settle.
-  requestAnimationFrame(() => applyDynamicBarThickness(chartInstance));
+  // resetZoom() doesn't fire zoom callbacks and leaves stale bar thickness.
+  // Force a full redraw one frame after the scales settle.
+  requestAnimationFrame(() => {
+    applyDynamicBarThickness(chartInstance);
+    chartInstance.update();
+  });
 }
 
 // Update the candlestick chart datasets in-place without destroying the instance.
@@ -980,15 +1086,15 @@ onUnmounted(() => {
             @keydown.enter="selectDecision(i)"
             @keydown.space.prevent="selectDecision(i)"
           >
-            <td>{{ d.entry_time }}</td>
+            <td>{{ formatDecisionTimestamp(d.entry_time) }}</td>
             <td :class="d.action === 'BUY' ? 'buy' : 'sell'">{{ d.action }}</td>
             <td>{{ d.strategy }}</td>
             <td class="num">{{ d.quantity ?? 1 }}</td>
-            <td class="num">{{ d.entry }}</td>
-            <td class="num">{{ d.stop_loss }}</td>
-            <td class="num">{{ d.take_profit }}</td>
+            <td class="num">{{ fmt2(d.entry) }}</td>
+            <td class="num">{{ fmt2(d.stop_loss) }}</td>
+            <td class="num">{{ fmt2(d.take_profit) }}</td>
             <td :class="exitClass(d.exit_reason)">
-              {{ d.exit_reason }} @ {{ d.exit_price }}
+              {{ d.exit_reason }} @ {{ fmt2(d.exit_price) }}
             </td>
             <td class="num" :class="pnlClass(d.pnl)">{{ formatPnl(d.pnl) }}</td>
             <td class="reason">{{ d.reason }}</td>

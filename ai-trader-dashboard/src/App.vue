@@ -17,18 +17,19 @@ const formatMoney = (value) =>
     maximumFractionDigits: 2,
   });
 
-/** M/d/Y HH:mm:ss (local time) */
+/** MM/DD/YY H:MMam/pm (local time) — e.g. 05/01/26 2:42pm */
 const formatTimestamp = (value) => {
   if (value == null || value === "") return "";
   const d = new Date(value);
   if (Number.isNaN(d.getTime())) return String(value);
-  const M = d.getMonth() + 1;
-  const dDay = d.getDate();
-  const Y = d.getFullYear();
-  const HH = String(d.getHours()).padStart(2, "0");
+  const M = String(d.getMonth() + 1).padStart(2, "0");
+  const D = String(d.getDate()).padStart(2, "0");
+  const Y = String(d.getFullYear()).slice(-2);
+  const h = d.getHours();
   const mm = String(d.getMinutes()).padStart(2, "0");
-  const ss = String(d.getSeconds()).padStart(2, "0");
-  return `${M}/${dDay}/${Y} ${HH}:${mm}:${ss}`;
+  const ampm = h >= 12 ? "pm" : "am";
+  const h12 = h % 12 === 0 ? 12 : h % 12;
+  return `${M}/${D}/${Y} ${h12}:${mm}${ampm}`;
 };
 
 function pnlClass(value) {

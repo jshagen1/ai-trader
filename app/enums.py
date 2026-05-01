@@ -9,7 +9,6 @@ class Action(str, Enum):
 
 class Strategy(str, Enum):
     ORB_BREAKOUT = "ORB_BREAKOUT"
-    VWAP_REVERSION = "VWAP_REVERSION"
     NONE = "NONE"
 
 

@@ -39,6 +39,8 @@ from app.constants import (
     POSITION_KEY_INITIAL_STOP,
     POSITION_KEY_STOP_LOSS,
     ORB_ENTRY_MAX_WICK_ATR,
+    ORB_ENTRY_PROXIMITY_ATR,
+    ORB_RSI_EXHAUSTION_LOOKBACK,
     QUANTITY_MAX_CONTRACTS_DEFAULT,
     QUANTITY_MAX_RISK_DOLLARS_DEFAULT,
     RECENT_BARS_QUERY_LIMIT_DEFAULT,
@@ -57,10 +59,6 @@ from app.constants import (
     TRAIL_PROFIT_MULTIPLIER_TIER_2,
     TRAIL_PROFIT_MULTIPLIER_TIER_3,
     TREND_SCORE_MIN,
-    VWAP_REVERSION_MAX_DISTANCE_ATR,
-    VWAP_REVERSION_MAX_UPPER_WICK_RATIO,
-    VWAP_REVERSION_MIN_BODY_RATIO,
-    VWAP_REVERSION_PULLBACK_LOOKBACK,
     orb_max_risk_points,
 )
 from app.enums import Action, HoldStrategy, PositionStatus, Strategy
@@ -137,12 +135,7 @@ class DecisionEngine:
         # See htf_regime.htf_regime_adaptive for the full graduation logic.
         htf_up, htf_down, _htf_period = htf_regime_adaptive(recent_bars, HTF_SLOPE_LOOKBACK)
 
-        signal = self.orb_breakout(market, minutes_after_open, htf_up, htf_down, loss_streak)
-        if signal.action != Action.HOLD.value:
-            return signal
-
-        # ORB didn't fire — try VWAP reversion as a complementary setup.
-        return self.vwap_reversion(market, recent_bars, minutes_after_open, htf_up, loss_streak)
+        return self.orb_breakout(market, minutes_after_open, htf_up, htf_down, loss_streak, recent_bars)
 
     def orb_breakout(
         self,
@@ -151,6 +144,7 @@ class DecisionEngine:
         htf_up: bool,
         htf_down: bool,
         loss_streak: int,
+        recent_bars: list[dict[str, Any]] | None = None,
     ) -> TradeSignal:
         # Wider stop for the first 30 min: opening range bars spike further and
         # a 1.25x ATR stop gets hit before the breakout extends.
@@ -172,6 +166,40 @@ class DecisionEngine:
 
         if risk <= 0:
             return self.hold(Strategy.ORB_BREAKOUT, "Invalid ATR")
+
+        # Require price to be at or above the ORB high (longs) / at or below the
+        # ORB low (shorts). A tiny ATR-based tolerance allows bars that tested the
+        # level intrabar and closed within 1-2 ticks below it (ORB_ENTRY_PROXIMITY_ATR
+        # = 0.15 ≈ half a tick of tolerance at typical ATR). Bars whose close is
+        # clearly inside the range are blocked — they have not broken out.
+        tolerance = m.atr * ORB_ENTRY_PROXIMITY_ATR
+        broke_high = m.price >= m.orb_high - tolerance
+        broke_low = m.price <= m.orb_low + tolerance
+        if not broke_high and not broke_low:
+            return self.hold(
+                HoldStrategy.TREND_FILTER,
+                f"No ORB breakout: price {m.price:.2f} not at ORB level "
+                f"[{m.orb_low:.2f}–{m.orb_high:.2f}] (tolerance {tolerance:.2f})",
+            )
+
+        # RSI exhaustion guard: if RSI was overbought (long) or oversold (short)
+        # within the recent lookback, the move is already exhausted. Re-entry of
+        # RSI into the valid range from an extreme signals fading momentum, not
+        # a fresh breakout.
+        lookback_bars = (recent_bars or [])[-ORB_RSI_EXHAUSTION_LOOKBACK:]
+        recent_rsi = [b["rsi"] for b in lookback_bars if b.get("rsi") is not None]
+        if broke_high and any(r > ORB_LONG_RSI_HIGH for r in recent_rsi):
+            return self.hold(
+                HoldStrategy.TREND_FILTER,
+                f"RSI exhaustion: long RSI was overbought (>{ORB_LONG_RSI_HIGH}) "
+                f"within last {ORB_RSI_EXHAUSTION_LOOKBACK} bars",
+            )
+        if broke_low and any(r < ORB_SHORT_RSI_LOW for r in recent_rsi):
+            return self.hold(
+                HoldStrategy.TREND_FILTER,
+                f"RSI exhaustion: short RSI was oversold (<{ORB_SHORT_RSI_LOW}) "
+                f"within last {ORB_RSI_EXHAUSTION_LOOKBACK} bars",
+            )
 
         long_score = 0.0
         if m.price > m.orb_high:
@@ -275,103 +303,6 @@ class DecisionEngine:
             entry=None,
             stop_loss=None,
             take_profit=None,
-        )
-
-    def vwap_reversion(
-        self,
-        m: Any,
-        recent_bars: list[dict[str, Any]],
-        minutes_after_open: int,
-        htf_up: bool,
-        loss_streak: int,
-    ) -> TradeSignal:
-        """Long-only VWAP reversion: pullback to VWAP in a strong uptrend, then bounce.
-
-        Only fires LONG. Shorts would need a downtrend confirmation that the existing
-        bridge-side `trend_score` is biased against producing.
-        """
-        atr = float(getattr(m, "atr", 0) or 0)
-        if atr <= 0:
-            return self.hold(Strategy.VWAP_REVERSION, "Invalid ATR for VWAP reversion")
-
-        if not htf_up:
-            return self.hold(
-                HoldStrategy.HTF_REGIME_FILTER,
-                "VWAP reversion long blocked: session not in uptrend",
-            )
-
-        lookback = VWAP_REVERSION_PULLBACK_LOOKBACK
-        if len(recent_bars) < lookback:
-            return self.hold(Strategy.VWAP_REVERSION, "Not enough recent bars")
-
-        cur_ts = str(getattr(m, "timestamp", ""))
-        prior = [b for b in recent_bars if str(b.get("timestamp")) != cur_ts][-lookback:]
-        if len(prior) < 3:
-            return self.hold(Strategy.VWAP_REVERSION, "Not enough prior bars after dedup")
-
-        # Require at least one bar in the window to have CLOSED at or below VWAP.
-        # A wick touch is not enough — price must have genuinely pulled back to the level.
-        closed_at_vwap = any(float(b["close"]) <= float(b["vwap"]) for b in prior)
-        if not closed_at_vwap:
-            return self.hold(Strategy.VWAP_REVERSION, "No bar closed at/below VWAP in lookback")
-
-        # The bar immediately before the current bar must still be at the VWAP level (low <= vwap).
-        # Ensures we are entering right at the bounce, not bars after the pullback already ended.
-        prev_bar = prior[-1]
-        if float(prev_bar["low"]) > float(prev_bar["vwap"]):
-            return self.hold(Strategy.VWAP_REVERSION, "Prior bar not at VWAP level — bounce already departed")
-
-        # Bounce: current bar is above VWAP, bullish, and not too extended.
-        if m.price <= m.vwap:
-            return self.hold(Strategy.VWAP_REVERSION, "Price still at/below VWAP")
-
-        if m.close <= m.open:
-            return self.hold(Strategy.VWAP_REVERSION, "Current bar not bullish")
-
-        bar_range = max(float(m.high) - float(m.low), 1e-9)
-        body = abs(float(m.close) - float(m.open))
-        if body / bar_range < VWAP_REVERSION_MIN_BODY_RATIO:
-            return self.hold(Strategy.VWAP_REVERSION, "Bounce bar body too small")
-
-        # Large upper wick means price surged but gave back gains — weak buyers.
-        upper_wick = float(m.high) - float(m.close)
-        if upper_wick / bar_range > VWAP_REVERSION_MAX_UPPER_WICK_RATIO:
-            return self.hold(
-                Strategy.VWAP_REVERSION,
-                f"Bounce bar upper wick too large ({upper_wick:.2f}pts, {upper_wick/bar_range:.0%} of range)",
-            )
-
-        # Current bar must close above the prior bar's close — momentum confirmation.
-        if float(m.close) <= float(prev_bar["close"]):
-            return self.hold(Strategy.VWAP_REVERSION, "Current close does not exceed prior bar close")
-
-        # Volume must be elevated on the bounce bar (committed buyers, not just drift).
-        avg_vol = float(getattr(m, "avg_volume", 0) or 0)
-        if avg_vol > 0 and float(m.volume) < avg_vol * ORB_VOLUME_SURGE_MULTIPLIER:
-            return self.hold(Strategy.VWAP_REVERSION, "Bounce bar volume not elevated")
-
-        if (m.price - m.vwap) > atr * VWAP_REVERSION_MAX_DISTANCE_ATR:
-            return self.hold(Strategy.VWAP_REVERSION, "Already extended too far above VWAP")
-
-        risk = atr * STRATEGY_ORB_ATR_MULTIPLIER
-        max_risk_points = orb_max_risk_points(minutes_after_open)
-        if risk > max_risk_points:
-            return self.hold(
-                HoldStrategy.RISK_FILTER,
-                f"VWAP reversion blocked: stop too wide ({risk:.2f} > {max_risk_points:.2f})",
-            )
-
-        quantity = self._sized_quantity(risk, loss_streak)
-        live = float(m.price)
-        return TradeSignal(
-            action=Action.BUY.value,
-            strategy=Strategy.VWAP_REVERSION.value,
-            confidence=0.75,
-            reason=f"VWAP reversion long: pullback bounce in uptrend, qty {quantity}, loss_streak {loss_streak}",
-            entry=live,
-            stop_loss=live - risk,
-            take_profit=live + risk * STRATEGY_ORB_REWARD_RISK_RATIO,
-            quantity=quantity,
         )
 
     def get_recent_bars(
