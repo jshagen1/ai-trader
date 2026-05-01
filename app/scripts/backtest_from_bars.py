@@ -19,15 +19,8 @@ from app.constants import (
     POINT_VALUE,
 )
 from app.decision_engine import DecisionEngine
-from app.decision_engine_v2 import DecisionEngineV2
 from app.enums import Action, ExitReason, PositionStatus
-from app.models.riley.models import RileyDecisionRequest
 from app.paths import PROJECT_ROOT, default_trades_db_path
-from app.riley_signal_adapter import (
-    bar_series_to_candle,
-    build_riley_decision_request_from_candles,
-    riley_response_to_trade_signal,
-)
 from app.pnl import calculate_pnl
 from app.slippage import (
     apply_entry_slippage,
@@ -41,17 +34,19 @@ DB_FILE: Path = default_trades_db_path()
 
 
 def _bar_calendar_dates(timestamps: pd.Series) -> pd.Series:
-    """Calendar date for --today / --history (naive = wall date; aware = local date)."""
-    try:
-        ts = pd.to_datetime(timestamps, format="mixed", errors="coerce")
-    except TypeError:
-        ts = timestamps.map(lambda x: pd.to_datetime(x, errors="coerce"))
-    if getattr(ts.dtype, "tz", None) is None:
-        return ts.dt.normalize().dt.date
-    local_tz = datetime.now().astimezone().tzinfo
-    if local_tz is None:
-        return ts.dt.normalize().dt.date
-    return ts.dt.tz_convert(local_tz).dt.date
+    """Calendar date for --today / --history filtering.
+
+    Pulls the date directly from the timestamp string prefix instead of going
+    through ``pd.to_datetime``, which raises on mixed-offset rows (the DB has
+    older naive timestamps and newer offset-bearing ones side by side). The
+    first 10 chars are always ``YYYY-MM-DD`` in the local clock for every
+    format the bridge writes, which is exactly what ``date.today()`` returns.
+    """
+    return pd.to_datetime(
+        timestamps.astype(str).str[:10],
+        format="%Y-%m-%d",
+        errors="coerce",
+    ).dt.date
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -69,28 +64,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Exclude bars from the current local date (prior days only).",
     )
-    parser.add_argument(
-        "strategy",
-        nargs="?",
-        default="auto",
-        choices=("auto", "v1", "v2"),
-        help=(
-            "auto: Riley if minutes_after_open < RileyConfig.max_minutes_after_open, "
-            "else ORB (same as POST /signal). v1: ORB only. v2: Riley only. Default: auto."
-        ),
-    )
     return parser.parse_args(argv)
-
-
-def build_riley_request(market: Any, bars: pd.DataFrame, index: int) -> RileyDecisionRequest:
-    """
-    Build the Riley v2 request: candle window ending at the current bar, plus
-    context fields used by risk / volatility scoring and pattern detectors.
-    """
-    start = max(0, index - BACKTEST_RECENT_BARS_WINDOW)
-    chunk = bars.iloc[start : index + 1]
-    candles = [bar_series_to_candle(row) for _, row in chunk.iterrows()]
-    return build_riley_decision_request_from_candles(market, candles)
 
 
 def to_market_state(row: Any) -> SimpleNamespace:
@@ -262,13 +236,11 @@ def analyze_results(trades: list[dict[str, Any]]) -> None:
 
 def main(
     *,
-    strategy: str = "auto",
     today: bool = False,
     history: bool = False,
 ) -> None:
     engine: Engine = create_engine(f"sqlite:///{DB_FILE}")
-    decision_engine_v1 = DecisionEngine()
-    decision_engine_v2 = DecisionEngineV2()
+    decision_engine = DecisionEngine()
 
     bars = pd.read_sql(
         "SELECT * FROM market_bars ORDER BY timestamp ASC",
@@ -285,38 +257,47 @@ def main(
         "trend_score", "chop_score",
     ]).reset_index(drop=True)
 
+    # Determine which bar indices to evaluate as entry candidates.
+    # IMPORTANT: the full `bars` DataFrame is always kept intact so that
+    # recent_bars and simulate_exit have complete multi-day history for context.
+    # Filtering bars to only the target date BEFORE the loop would strip the
+    # historical context needed by the HTF regime filter (needs 30-60 bars of
+    # warmup), causing it to return (False, False) and block all early entries.
+    cal_dates = _bar_calendar_dates(bars["timestamp"])
+
     if today:
         today_local = date.today()
-        mask = _bar_calendar_dates(bars["timestamp"]) == today_local
-        bars = bars.loc[mask].reset_index(drop=True)
-        print(f"Filtered to local date {today_local}: {len(bars)} bars")
-        if bars.empty:
+        candidate_mask = cal_dates == today_local
+        candidate_indices = bars.index[candidate_mask].tolist()
+        print(f"Evaluating {len(candidate_indices)} bars for local date {today_local}")
+        if not candidate_indices:
             print("No bars for today.")
             return
 
-    if history:
+    elif history:
         today_local = date.today()
-        mask = _bar_calendar_dates(bars["timestamp"]) != today_local
-        bars = bars.loc[mask].reset_index(drop=True)
-        print(f"Excluded local date {today_local}: {len(bars)} bars")
-        if bars.empty:
+        candidate_mask = cal_dates != today_local
+        candidate_indices = bars.index[candidate_mask].tolist()
+        print(f"Evaluating {len(candidate_indices)} bars excluding local date {today_local}")
+        if not candidate_indices:
             print("No bars after excluding today.")
             return
 
-    riley_max = decision_engine_v2.config.max_minutes_after_open
-    print(f"Loaded {len(bars)} bars")
-    if strategy == "auto":
-        print(
-            f"Strategy: auto (Riley if minutes_after_open < {riley_max}, else ORB)",
-        )
     else:
-        print(f"Strategy: {strategy} (forced)")
+        candidate_indices = list(range(len(bars)))
+
+    # Trim candidates so every entry has at least BACKTEST_MAX_LOOKAHEAD_BARS
+    # future bars available for exit simulation.
+    last_valid = len(bars) - BACKTEST_MAX_LOOKAHEAD_BARS
+    candidate_indices = [i for i in candidate_indices if i < last_valid]
+
+    print(f"Loaded {len(bars)} total bars ({len(candidate_indices)} candidates)")
     print("Starting backtest...")
 
     trades = []
     skip_until_index = -1
 
-    for i in range(len(bars) - BACKTEST_MAX_LOOKAHEAD_BARS):
+    for i in candidate_indices:
         if i % 1000 == 0:
             print(f"Processing bar {i}/{len(bars)}")
 
@@ -328,18 +309,7 @@ def main(
         )
         market = to_market_state(bars.iloc[i])
 
-        if strategy == "v1":
-            signal = decision_engine_v1.decide(market, recent_bars)
-        elif strategy == "v2":
-            request = build_riley_request(market, bars, i)
-            riley_resp = decision_engine_v2.decide(request)
-            signal = riley_response_to_trade_signal(market, riley_resp)
-        elif market.minutes_after_open < riley_max:
-            request = build_riley_request(market, bars, i)
-            riley_resp = decision_engine_v2.decide(request)
-            signal = riley_response_to_trade_signal(market, riley_resp)
-        else:
-            signal = decision_engine_v1.decide(market, recent_bars)
+        signal = decision_engine.decide(market, recent_bars)
 
         if signal.action not in (Action.BUY.value, Action.SELL.value):
             continue
@@ -395,7 +365,6 @@ def main(
 if __name__ == "__main__":
     _args = parse_args()
     main(
-        strategy=_args.strategy,
         today=_args.today,
         history=_args.history,
     )

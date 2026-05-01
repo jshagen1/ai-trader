@@ -3,11 +3,18 @@ from __future__ import annotations
 from typing import Any
 
 import pandas as pd
-from fastapi import FastAPI
+from fastapi import Body, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from typing import Annotated
 from sqlalchemy.orm import Session
 
 from app.analytics.dashboard import build_dashboard_summary
+from app.analytics.session_view import (
+    cache_stats as session_cache_stats,
+    clear_cache as clear_session_cache,
+    list_available_dates,
+    session_view,
+)
 from app.constants import (
     CORS_ALLOW_ORIGINS,
     HEALTH_STATUS_OK,
@@ -17,29 +24,25 @@ from app.constants import (
     RECENT_BARS_QUERY_LIMIT_DEFAULT,
 )
 from app.decision_engine import DecisionEngine
-from app.decision_engine_v2 import DecisionEngineV2
 from app.db.database import Base
 from app.db.database import SessionLocal
 from app.db.database import engine
-from app.db.models_db import CompletedTrade, MarketBar, TradeLog
+from app.db.market_bar_store import upsert_market_bar
+from app.db.models_db import CompletedTrade, OrderSkip, TradeLog
+from app.loss_streak import get_loss_streak_today
 from app.models.market_state import MarketState
 from app.models.trade_signal import TradeSignal
-from app.riley_signal_adapter import (
-    build_riley_decision_request,
-    riley_response_to_trade_signal,
-)
+from app.signal_guards import guard_signal_against_desync
 from app.slippage import trade_slippage_points_and_dollars
 
 app = FastAPI()
 decision_engine = DecisionEngine()
-decision_engine_v2 = DecisionEngineV2()
 
 Base.metadata.create_all(bind=engine)
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=list(CORS_ALLOW_ORIGINS),
-    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -95,40 +98,19 @@ def log_trade(data: dict[str, Any]) -> dict[str, str]:
 def get_signal(market: MarketState) -> TradeSignal:
     db: Session = SessionLocal()
 
-    try:
-        bar = MarketBar(
-            timestamp=market.timestamp,
-            symbol=market.symbol,
-            open=market.open,
-            high=market.high,
-            low=market.low,
-            close=market.close,
-            volume=market.volume,
-            avg_volume=market.avg_volume,
-            vwap=market.vwap,
-            atr=market.atr,
-            rsi=market.rsi,
-            orb_high=market.orb_high,
-            orb_low=market.orb_low,
-            trend_score=market.trend_score,
-            chop_score=market.chop_score,
-            minutes_after_open=market.minutes_after_open,
-        )
 
-        db.add(bar)
+    try:
+        upsert_market_bar(db, market)
         db.commit()
 
         recent_bars = decision_engine.get_recent_bars(
             db, market.symbol, limit=RECENT_BARS_QUERY_LIMIT_DEFAULT
         )
+        loss_streak = get_loss_streak_today(db, as_of_iso=market.timestamp)
 
-        # Use Riley decision engine for early sessions.
-        if market.minutes_after_open < decision_engine_v2.config.max_minutes_after_open:
-            riley_req = build_riley_decision_request(market, recent_bars)
-            riley_resp = decision_engine_v2.decide(riley_req)
-            signal = riley_response_to_trade_signal(market, riley_resp)
-        else:
-            signal = decision_engine.decide(market, recent_bars)
+        signal = decision_engine.decide(market, recent_bars, loss_streak=loss_streak)
+
+        signal = guard_signal_against_desync(market, signal)
 
         log = TradeLog(
             timestamp=market.timestamp,
@@ -157,65 +139,6 @@ def get_signal(market: MarketState) -> TradeSignal:
     finally:
         db.close()
 
-
-@app.post("/signal-v2", response_model=TradeSignal)
-def get_signal_v2(market: MarketState) -> TradeSignal:
-    db: Session = SessionLocal()
-
-    try:
-        bar = MarketBar(
-            timestamp=market.timestamp,
-            symbol=market.symbol,
-            open=market.open,
-            high=market.high,
-            low=market.low,
-            close=market.close,
-            volume=market.volume,
-            avg_volume=market.avg_volume,
-            vwap=market.vwap,
-            atr=market.atr,
-            rsi=market.rsi,
-            orb_high=market.orb_high,
-            orb_low=market.orb_low,
-            trend_score=market.trend_score,
-            chop_score=market.chop_score,
-        )
-
-        db.add(bar)
-        db.commit()
-
-        recent_bars = decision_engine.get_recent_bars(
-            db, market.symbol, limit=RECENT_BARS_QUERY_LIMIT_DEFAULT
-        )
-
-        signal = decision_engine.decide(market, recent_bars)
-
-        log = TradeLog(
-            timestamp=market.timestamp,
-            symbol=market.symbol,
-            price=market.price,
-            vwap=market.vwap,
-            atr=market.atr,
-            rsi=market.rsi,
-            orb_high=market.orb_high,
-            orb_low=market.orb_low,
-            volume=market.volume,
-            avg_volume=market.avg_volume,
-            trend_score=market.trend_score,
-            chop_score=market.chop_score,
-            action=signal.action,
-            strategy=signal.strategy,
-            confidence=signal.confidence,
-            reason=signal.reason,
-        )
-
-        db.add(log)
-        db.commit()
-
-        return signal
-
-    finally:
-        db.close()
 
 
 @app.post("/manage-position")
@@ -228,12 +151,117 @@ def manage_position(position: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+@app.post("/backfill")
+def backfill_bars(
+    bars: Annotated[list[dict[str, Any]], Body()],
+) -> dict[str, Any]:
+    """Accept a batch of historical bars from the NinjaTrader bridge and store them.
+
+    Called once per session when the bridge starts up (or reconnects) to sync bars
+    that the API missed while offline. Safe to call multiple times — the underlying
+    INSERT OR IGNORE discards any bar whose (symbol, timestamp) already exists.
+
+    Body must be a JSON array matching the MarketState field set.
+    Only active-session bars should be sent (bridge filters pre-market / overnight).
+    """
+    db: Session = SessionLocal()
+    try:
+        stored = 0
+        for raw in bars:
+            try:
+                market = MarketState(
+                    symbol=raw["symbol"],
+                    timestamp=raw["timestamp"],
+                    open=float(raw["open"]),
+                    high=float(raw["high"]),
+                    low=float(raw["low"]),
+                    close=float(raw["close"]),
+                    price=float(raw["price"]),
+                    vwap=float(raw["vwap"]),
+                    atr=float(raw["atr"]),
+                    rsi=float(raw["rsi"]),
+                    orb_high=float(raw["orb_high"]),
+                    orb_low=float(raw["orb_low"]),
+                    volume=float(raw["volume"]),
+                    avg_volume=float(raw.get("avg_volume", 0) or 0),
+                    trend_score=float(raw["trend_score"]),
+                    chop_score=float(raw["chop_score"]),
+                    position=str(raw.get("position", "flat")),
+                    minutes_after_open=int(raw["minutes_after_open"]),
+                )
+                upsert_market_bar(db, market)
+                stored += 1
+            except (KeyError, TypeError, ValueError):
+                # Skip malformed bars rather than aborting the whole batch.
+                continue
+        db.commit()
+        return {"status": HEALTH_STATUS_OK, "bars_stored": stored, "bars_received": len(bars)}
+    finally:
+        db.close()
+
+
+@app.post("/skip")
+def log_order_skip(data: dict[str, Any]) -> dict[str, str]:
+    """Bridge calls this when it skips an order client-side (e.g. signal-vs-live drift)."""
+    db: Session = SessionLocal()
+
+    try:
+        skip = OrderSkip(
+            timestamp=data.get("timestamp"),
+            symbol=data.get("symbol"),
+            action=data.get("action"),
+            signal_entry=data.get("signal_entry"),
+            live_quote=data.get("live_quote"),
+            drift_points=data.get("drift_points"),
+            reason=data.get("reason"),
+        )
+        db.add(skip)
+        db.commit()
+        return {"status": HEALTH_STATUS_OK}
+    finally:
+        db.close()
+
+
+@app.get("/dashboard/sessions")
+def dashboard_sessions() -> dict[str, Any]:
+    db: Session = SessionLocal()
+    try:
+        return {"dates": list_available_dates(db)}
+    finally:
+        db.close()
+
+
+@app.get("/dashboard/sessions/{date_str}")
+def dashboard_session(date_str: str) -> dict[str, Any]:
+    db: Session = SessionLocal()
+    try:
+        return session_view(db, date_str)
+    finally:
+        db.close()
+
+
+@app.get("/dashboard/cache")
+def dashboard_cache_stats() -> dict[str, Any]:
+    """Visibility into the session_view cache: size + hit/miss counters."""
+    return session_cache_stats()
+
+
+@app.post("/dashboard/cache/clear")
+def dashboard_cache_clear() -> dict[str, str]:
+    """Manually drop the cache (e.g. after editing strategy constants without restart)."""
+    clear_session_cache()
+    return {"status": HEALTH_STATUS_OK}
+
+
 @app.get("/dashboard/summary")
 def dashboard_summary() -> dict[str, Any]:
     db: Session = SessionLocal()
 
     try:
-        df = pd.read_sql("SELECT * FROM completed_trades", db.bind)
-        return build_dashboard_summary(df)
+        trades_df = pd.read_sql("SELECT * FROM completed_trades", db.bind)
+        skips_df = pd.read_sql(
+            "SELECT * FROM order_skips ORDER BY id DESC", db.bind
+        )
+        return build_dashboard_summary(trades_df, skips_df)
     finally:
         db.close()

@@ -4,6 +4,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
+from app.db.schema_migrations import ensure_sqlite_schema
 from app.paths import default_trades_db_path
 
 _db_file = default_trades_db_path().resolve()
@@ -18,6 +19,8 @@ engine: Engine = create_engine(
     DATABASE_URL,
     connect_args={"check_same_thread": False},
 )
+
+ensure_sqlite_schema(engine)
 
 SessionLocal = sessionmaker(
     autocommit=False,

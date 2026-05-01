@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
 import pandas as pd
@@ -17,12 +18,47 @@ def empty_dashboard_summary() -> dict[str, Any]:
         "max_drawdown": 0,
         "equity_curve": [],
         "recent_trades": [],
+        "total_skips": 0,
+        "skips_today": 0,
+        "skips_by_reason": {},
+        "recent_skips": [],
     }
 
 
-def build_dashboard_summary(df: pd.DataFrame) -> dict[str, Any]:
+def _summarize_skips(skips_df: pd.DataFrame | None) -> dict[str, Any]:
+    if skips_df is None or skips_df.empty:
+        return {
+            "total_skips": 0,
+            "skips_today": 0,
+            "skips_by_reason": {},
+            "recent_skips": [],
+        }
+
+    today_prefix = datetime.now().isoformat()[:10]
+    today_mask = skips_df["timestamp"].astype(str).str.startswith(today_prefix)
+
+    by_reason = (
+        skips_df["reason"].fillna("unknown").value_counts().to_dict()
+        if "reason" in skips_df.columns
+        else {}
+    )
+
+    return {
+        "total_skips": int(len(skips_df)),
+        "skips_today": int(today_mask.sum()),
+        "skips_by_reason": {str(k): int(v) for k, v in by_reason.items()},
+        "recent_skips": skips_df.head(20).to_dict(orient="records"),
+    }
+
+
+def build_dashboard_summary(
+    df: pd.DataFrame,
+    skips_df: pd.DataFrame | None = None,
+) -> dict[str, Any]:
+    skip_stats = _summarize_skips(skips_df)
+
     if df.empty:
-        return empty_dashboard_summary()
+        return {**empty_dashboard_summary(), **skip_stats}
 
     wins = df[df["pnl"] > 0]
     losses = df[df["pnl"] <= 0]
@@ -57,4 +93,5 @@ def build_dashboard_summary(df: pd.DataFrame) -> dict[str, Any]:
             for i, row in df.iterrows()
         ],
         "recent_trades": df.tail(20).to_dict(orient="records"),
+        **skip_stats,
     }

@@ -1,18 +1,7 @@
 <script setup>
-import { ref, onMounted, computed } from "vue";
+import { ref, onMounted } from "vue";
 import axios from "axios";
-import {
-  Chart as ChartJS,
-  LineElement,
-  PointElement,
-  LinearScale,
-  CategoryScale,
-  Tooltip,
-  Legend,
-} from "chart.js";
-import { Line } from "vue-chartjs";
-
-ChartJS.register(LineElement, PointElement, LinearScale, CategoryScale, Tooltip, Legend);
+import SessionChart from "./components/SessionChart.vue";
 
 const summary = ref(null);
 
@@ -21,24 +10,6 @@ const fetchSummary = async () => {
   summary.value = res.data;
 };
 
-const equityCurve = computed(() => summary.value?.equity_curve ?? []);
-
-const chartData = computed(() => ({
-  labels: equityCurve.value.map((x) => String(x.trade)),
-  datasets: [
-    {
-      label: "Cumulative equity",
-      data: equityCurve.value.map((x) => x.equity),
-      borderColor: "#2563eb",
-      backgroundColor: "rgba(37, 99, 235, 0.12)",
-      borderWidth: 2,
-      tension: 0.2,
-      pointRadius: 3,
-      pointHoverRadius: 6,
-      pointHoverBorderWidth: 2,
-    },
-  ],
-}));
 
 const formatMoney = (value) =>
   Number(value).toLocaleString(undefined, {
@@ -60,108 +31,126 @@ const formatTimestamp = (value) => {
   return `${M}/${dDay}/${Y} ${HH}:${mm}:${ss}`;
 };
 
-const chartOptions = computed(() => {
-  const curve = equityCurve.value;
-  return {
-    responsive: true,
-    maintainAspectRatio: false,
-    interaction: {
-      mode: "index",
-      intersect: false,
-    },
-    plugins: {
-      legend: {
-        display: true,
-        position: "top",
-      },
-      tooltip: {
-        enabled: true,
-        callbacks: {
-          title: (items) => {
-            const i = items[0]?.dataIndex;
-            const row = curve[i];
-            return row != null ? `Trade ${row.trade}` : "";
-          },
-          label: (item) => {
-            const y = item.parsed?.y ?? item.raw;
-            return `Equity: $${formatMoney(y)}`;
-          },
-        },
-      },
-    },
-    scales: {
-      x: {
-        title: {
-          display: true,
-          text: "Trade #",
-        },
-        ticks: {
-          maxRotation: 45,
-          autoSkip: true,
-          maxTicksLimit: 12,
-        },
-      },
-      y: {
-        title: {
-          display: true,
-          text: "Equity ($)",
-        },
-        ticks: {
-          callback: (value) => `$${formatMoney(value)}`,
-        },
-      },
-    },
-  };
-});
+function pnlClass(value) {
+  if (value == null || value === "") return "neutral";
+  const n = Number(value);
+  if (Number.isNaN(n)) return "neutral";
+  if (n > 0) return "win";
+  if (n < 0) return "loss";
+  return "neutral";
+}
 
 onMounted(fetchSummary);
 </script>
 
 <template>
   <main class="page">
-    <h1>AI Trader Dashboard</h1>
+    <header class="topbar">
+      <h1>AI Trader</h1>
+      <span class="subtitle">strategy dashboard</span>
+    </header>
 
-    <p v-if="!summary">Loading...</p>
+    <p v-if="!summary" class="loading">Loading…</p>
 
     <section v-else>
       <div class="cards">
         <div class="card">
-          <span>Total Trades</span>
-          <strong>{{ summary.total_trades }}</strong>
+          <span class="label">Total Trades</span>
+          <strong class="value">{{ summary.total_trades }}</strong>
         </div>
 
         <div class="card">
-          <span>Win Rate</span>
-          <strong>{{ summary.win_rate }}%</strong>
+          <span class="label">Win Rate</span>
+          <strong class="value">{{ summary.win_rate }}%</strong>
         </div>
 
         <div class="card">
-          <span>Net PnL</span>
-          <strong>${{ summary.net_pnl }}</strong>
+          <span class="label">Net PnL</span>
+          <strong class="value" :class="pnlClass(summary.net_pnl)">
+            ${{ summary.net_pnl }}
+          </strong>
         </div>
 
         <div class="card">
-          <span>Expectancy</span>
-          <strong>${{ summary.expectancy }}</strong>
+          <span class="label">Expectancy</span>
+          <strong class="value" :class="pnlClass(summary.expectancy)">
+            ${{ summary.expectancy }}
+          </strong>
         </div>
 
         <div class="card">
-          <span>Profit Factor</span>
-          <strong>{{ summary.profit_factor }}</strong>
+          <span class="label">Profit Factor</span>
+          <strong class="value">{{ summary.profit_factor }}</strong>
         </div>
 
         <div class="card">
-          <span>Max Drawdown</span>
-          <strong>${{ summary.max_drawdown }}</strong>
+          <span class="label">Max Drawdown</span>
+          <strong class="value loss">${{ summary.max_drawdown }}</strong>
+        </div>
+
+        <div class="card">
+          <span class="label">Skips Today</span>
+          <strong class="value">{{ summary.skips_today ?? 0 }}</strong>
+          <small v-if="summary.total_skips">
+            {{ summary.total_skips }} total
+          </small>
         </div>
       </div>
 
       <div class="panel">
-        <h2 class="section-title">Equity Curve</h2>
+        <h2 class="section-title">Session Decisions</h2>
+        <p class="hint">
+          Pick a trading date to see candlesticks for that session, the ORB high/low,
+          and every BUY / SELL decision the engine would make today against historical
+          data — including each trade's stop, target, and exit outcome. Hover any
+          marker for the entry reason.
+        </p>
+        <SessionChart />
+      </div>
 
-        <div class="chart-wrap">
-          <Line :data="chartData" :options="chartOptions" />
+      <div v-if="summary.recent_skips && summary.recent_skips.length" class="panel">
+        <h2 class="section-title">Recent Skipped Orders</h2>
+
+        <p class="hint">
+          Orders the bridge declined to submit because the live quote drifted too far
+          from the signal entry between bar close and submission.
+        </p>
+
+        <div class="reason-pills">
+          <span
+            v-for="(count, reason) in summary.skips_by_reason"
+            :key="reason"
+            class="pill"
+          >
+            {{ reason }}: {{ count }}
+          </span>
         </div>
+
+        <table>
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Symbol</th>
+              <th>Action</th>
+              <th>Signal Entry</th>
+              <th>Live Quote</th>
+              <th>Drift (pts)</th>
+              <th>Reason</th>
+            </tr>
+          </thead>
+
+          <tbody>
+            <tr v-for="skip in summary.recent_skips" :key="skip.id">
+              <td>{{ formatTimestamp(skip.timestamp) }}</td>
+              <td>{{ skip.symbol }}</td>
+              <td>{{ skip.action }}</td>
+              <td>{{ skip.signal_entry }}</td>
+              <td>{{ skip.live_quote }}</td>
+              <td>{{ Number(skip.drift_points).toFixed(2) }}</td>
+              <td>{{ skip.reason }}</td>
+            </tr>
+          </tbody>
+        </table>
       </div>
 
       <div class="panel">
@@ -183,10 +172,12 @@ onMounted(fetchSummary);
             <tr v-for="trade in summary.recent_trades" :key="trade.id">
               <td>{{ formatTimestamp(trade.timestamp) }}</td>
               <td>{{ trade.symbol }}</td>
-              <td>{{ trade.action }}</td>
-              <td>{{ trade.entry_price }}</td>
-              <td>{{ trade.exit_price }}</td>
-              <td>${{ trade.pnl }}</td>
+              <td :class="trade.action === 'BUY' ? 'win' : 'loss'">
+                {{ trade.action }}
+              </td>
+              <td class="num">{{ trade.entry_price }}</td>
+              <td class="num">{{ trade.exit_price }}</td>
+              <td class="num" :class="pnlClass(trade.pnl)">${{ trade.pnl }}</td>
             </tr>
           </tbody>
         </table>
@@ -197,60 +188,175 @@ onMounted(fetchSummary);
 
 <style>
 .page {
-  max-width: 1200px;
+  max-width: 1280px;
   margin: 0 auto;
-  padding: 32px;
-  font-family: system-ui, sans-serif;
+  padding: 24px 28px 48px;
+}
+
+.topbar {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  padding: 8px 0 18px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 24px;
+}
+
+.topbar h1 {
+  letter-spacing: 0.2px;
+}
+
+.topbar .subtitle {
+  color: var(--text-muted);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 1.2px;
+}
+
+.loading {
+  color: var(--text-muted);
+  padding: 12px 0;
 }
 
 .cards {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 16px;
-  margin-bottom: 24px;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  gap: 12px;
+  margin-bottom: 20px;
 }
 
-.card,
-.panel {
-  border: 1px solid #ddd;
-  border-radius: 12px;
-  padding: 20px;
-  background: white;
+@media (max-width: 1100px) {
+  .cards {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+}
+@media (max-width: 720px) {
+  .cards {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }
 
-.card span {
+.card {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 12px 14px;
+  min-width: 0;
+}
+
+.card .label {
   display: block;
-  color: #666;
-  margin-bottom: 8px;
+  color: var(--text-muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  margin-bottom: 6px;
 }
 
-.card strong {
-  font-size: 28px;
+.card .value {
+  font-size: 20px;
+  font-weight: 600;
+  color: var(--text-strong);
+  font-variant-numeric: tabular-nums;
+}
+
+.card .value.win {
+  color: var(--green-strong);
+}
+
+.card .value.loss {
+  color: var(--red-strong);
+}
+
+.card small {
+  display: block;
+  color: var(--text-dim);
+  font-size: 11px;
+  margin-top: 4px;
 }
 
 .panel {
-  margin-top: 24px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 20px;
+  margin-top: 16px;
 }
 
 .section-title {
-  color: black;
+  margin-bottom: 8px;
 }
 
 .chart-wrap {
   position: relative;
-  height: 360px;
-  margin-top: 12px;
+  height: 320px;
+  margin-top: 8px;
 }
 
 table {
   width: 100%;
   border-collapse: collapse;
+  font-size: 13px;
 }
 
-th,
-td {
-  border-bottom: 1px solid #eee;
-  padding: 10px;
+th {
   text-align: left;
+  padding: 8px 10px;
+  color: var(--text-muted);
+  font-weight: 500;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  border-bottom: 1px solid var(--border-strong);
+  background: var(--bg-elevated);
+  position: sticky;
+  top: 0;
+}
+
+td {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text);
+}
+
+td.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.win {
+  color: var(--green-strong);
+  font-weight: 500;
+}
+
+.loss {
+  color: var(--red-strong);
+  font-weight: 500;
+}
+
+.neutral {
+  color: var(--text-muted);
+}
+
+.hint {
+  color: var(--text-muted);
+  font-size: 12px;
+  margin: 4px 0 14px;
+}
+
+.reason-pills {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+
+.pill {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  padding: 3px 10px;
+  font-size: 11px;
+  color: var(--text-muted);
 }
 </style>
