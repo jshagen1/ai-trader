@@ -34,17 +34,37 @@ DB_FILE: Path = default_trades_db_path()
 
 
 def _bar_calendar_dates(timestamps: pd.Series) -> pd.Series:
-    """Calendar date for --today / --history (naive = wall date; aware = local date)."""
-    try:
-        ts = pd.to_datetime(timestamps, format="mixed", errors="coerce")
-    except TypeError:
-        ts = timestamps.map(lambda x: pd.to_datetime(x, errors="coerce"))
-    if getattr(ts.dtype, "tz", None) is None:
-        return ts.dt.normalize().dt.date
-    local_tz = datetime.now().astimezone().tzinfo
-    if local_tz is None:
-        return ts.dt.normalize().dt.date
-    return ts.dt.tz_convert(local_tz).dt.date
+    """Calendar date for --today / --history filtering.
+
+    Pulls the date directly from the timestamp string prefix instead of going
+    through ``pd.to_datetime``, which raises on mixed-offset rows (the DB has
+    older naive timestamps and newer offset-bearing ones side by side). The
+    first 10 chars are always ``YYYY-MM-DD`` in the local clock for every
+    format the bridge writes, which is exactly what ``date.today()`` returns.
+    """
+    return pd.to_datetime(
+        timestamps.astype(str).str[:10],
+        format="%Y-%m-%d",
+        errors="coerce",
+    ).dt.date
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Backtest using market_bars from SQLite.",
+    )
+    when = parser.add_mutually_exclusive_group()
+    when.add_argument(
+        "--today",
+        action="store_true",
+        help="Only backtest bars from the current local date.",
+    )
+    when.add_argument(
+        "--history",
+        action="store_true",
+        help="Exclude bars from the current local date (prior days only).",
+    )
+    return parser.parse_args(argv)
 
 
 def to_market_state(row: Any) -> SimpleNamespace:
@@ -149,7 +169,7 @@ def analyze_results(trades: list[dict[str, Any]]) -> None:
         print(f"Trades: {len(df_without_top2)}")
         print(f"Net PnL: ${df_without_top2['pnl'].sum():.2f}")
         print(f"Profit Factor: {profit_factor_top2:.2f}")
-        
+
         if "slippage_dollars" in df_without_top2.columns:
             print(f"Slippage: ${df_without_top2['slippage_dollars'].sum():.2f}")
 
@@ -187,7 +207,7 @@ def analyze_results(trades: list[dict[str, Any]]) -> None:
     print(f"Expectancy: ${expectancy:.2f}")
     print(f"Profit Factor: {profit_factor:.2f}")
     print(f"Max Drawdown: ${df['drawdown'].min():.2f}")
-    
+
     if "slippage_dollars" in df.columns:
         print("\nSlippage Summary")
         print("----------------")
@@ -201,7 +221,7 @@ def analyze_results(trades: list[dict[str, Any]]) -> None:
     print("\nBy Strategy")
     print("-----------")
     print(df.groupby("strategy")["pnl"].agg(["count", "sum", "mean", "min", "max"]))
-    
+
     print("\nBy Time Bucket")
     print("--------------")
     print(
@@ -214,7 +234,11 @@ def analyze_results(trades: list[dict[str, Any]]) -> None:
     print(f"\nSaved: {out}")
 
 
-def main(*, today: bool = False, history: bool = False) -> None:
+def main(
+    *,
+    today: bool = False,
+    history: bool = False,
+) -> None:
     engine: Engine = create_engine(f"sqlite:///{DB_FILE}")
     decision_engine = DecisionEngine()
 
@@ -233,31 +257,47 @@ def main(*, today: bool = False, history: bool = False) -> None:
         "trend_score", "chop_score",
     ]).reset_index(drop=True)
 
+    # Determine which bar indices to evaluate as entry candidates.
+    # IMPORTANT: the full `bars` DataFrame is always kept intact so that
+    # recent_bars and simulate_exit have complete multi-day history for context.
+    # Filtering bars to only the target date BEFORE the loop would strip the
+    # historical context needed by the HTF regime filter (needs 30-60 bars of
+    # warmup), causing it to return (False, False) and block all early entries.
+    cal_dates = _bar_calendar_dates(bars["timestamp"])
+
     if today:
         today_local = date.today()
-        mask = _bar_calendar_dates(bars["timestamp"]) == today_local
-        bars = bars.loc[mask].reset_index(drop=True)
-        print(f"Filtered to local date {today_local}: {len(bars)} bars")
-        if bars.empty:
+        candidate_mask = cal_dates == today_local
+        candidate_indices = bars.index[candidate_mask].tolist()
+        print(f"Evaluating {len(candidate_indices)} bars for local date {today_local}")
+        if not candidate_indices:
             print("No bars for today.")
             return
 
-    if history:
+    elif history:
         today_local = date.today()
-        mask = _bar_calendar_dates(bars["timestamp"]) != today_local
-        bars = bars.loc[mask].reset_index(drop=True)
-        print(f"Excluded local date {today_local}: {len(bars)} bars")
-        if bars.empty:
+        candidate_mask = cal_dates != today_local
+        candidate_indices = bars.index[candidate_mask].tolist()
+        print(f"Evaluating {len(candidate_indices)} bars excluding local date {today_local}")
+        if not candidate_indices:
             print("No bars after excluding today.")
             return
 
-    print(f"Loaded {len(bars)} bars")
+    else:
+        candidate_indices = list(range(len(bars)))
+
+    # Trim candidates so every entry has at least BACKTEST_MAX_LOOKAHEAD_BARS
+    # future bars available for exit simulation.
+    last_valid = len(bars) - BACKTEST_MAX_LOOKAHEAD_BARS
+    candidate_indices = [i for i in candidate_indices if i < last_valid]
+
+    print(f"Loaded {len(bars)} total bars ({len(candidate_indices)} candidates)")
     print("Starting backtest...")
 
     trades = []
     skip_until_index = -1
 
-    for i in range(len(bars) - BACKTEST_MAX_LOOKAHEAD_BARS):
+    for i in candidate_indices:
         if i % 1000 == 0:
             print(f"Processing bar {i}/{len(bars)}")
 
@@ -277,7 +317,7 @@ def main(*, today: bool = False, history: bool = False) -> None:
         quantity = getattr(signal, "quantity", 1) or 1
 
         exit_price, exit_reason, exit_time = simulate_exit(bars, i, signal)
-        
+
         slipped_entry = apply_entry_slippage(signal.action, signal.entry)
         slipped_exit = apply_exit_slippage(signal.action, exit_price)
 
@@ -323,17 +363,8 @@ def main(*, today: bool = False, history: bool = False) -> None:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Backtest from market_bars SQLite.")
-    when = parser.add_mutually_exclusive_group()
-    when.add_argument(
-        "--today",
-        action="store_true",
-        help="Only backtest bars from the current local date.",
+    _args = parse_args()
+    main(
+        today=_args.today,
+        history=_args.history,
     )
-    when.add_argument(
-        "--history",
-        action="store_true",
-        help="Exclude bars from the current local date (prior days only).",
-    )
-    args = parser.parse_args()
-    main(today=args.today, history=args.history)

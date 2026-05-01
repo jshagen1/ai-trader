@@ -16,9 +16,18 @@ namespace NinjaTrader.NinjaScript.Strategies
         private static readonly HttpClient client = new HttpClient();
         private string apiBaseUrl = "http://192.168.12.247:8000";
 
+        // Pin all session math to US Central Time regardless of the machine's zone or
+        // the chart's display zone. Falls back to America/Chicago for non-Windows hosts.
+        private static readonly TimeZoneInfo CentralTimeZone = ResolveCentralTimeZone();
+
+        // ORB window is the CME equity-index cash-open: 08:30:00 - 08:45:00 CT.
+        private static readonly TimeSpan OrbWindowStart = new TimeSpan(8, 30, 0);
+        private static readonly TimeSpan OrbWindowEnd = new TimeSpan(8, 45, 0);
+
         private double orbHigh = 0;
         private double orbLow = 0;
         private bool orbComplete = false;
+        private bool tradingDisabledForDay = false;
 
         private double cumulativePV = 0;
         private double cumulativeVolume = 0;
@@ -33,6 +42,20 @@ namespace NinjaTrader.NinjaScript.Strategies
         private double activeTakeProfit = 0;
         private double initialStopLoss = 0;
         private DateTime lastManageCall = Core.Globals.MinDate;
+
+        // Tracks whether we've sent today's historical bars to the API this session.
+        // Reset to false on each new trading date so the backfill runs once per session.
+        private bool barBackfillDone = false;
+
+        // Stop/target are submitted as tick offsets from entry — these track the points
+        // form so OnExecutionUpdate can compute the absolute fill-relative prices for the
+        // trailing-stop logic without trusting the now-stale signal `entry`.
+        private double pendingRiskPoints = 0;
+        private double pendingRewardPoints = 0;
+
+        // If the live quote drifts more than this from the signal entry between bar close
+        // and order submission, skip the trade rather than fill at a far-off price.
+        private const double MaxSignalDriftPoints = 3.0;
 
         protected override void OnStateChange()
         {
@@ -69,17 +92,48 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (CurrentBar < 50)
                 return;
 
-            if (currentSessionDate.Date != Time[0].Date)
+            // Only call the API on the primary series in live mode so JSON price/close match the chart.
+            if (State != State.Realtime)
+                return;
+
+            if (BarsInProgress != 0)
+                return;
+
+            DateTime barTimeCT = ConvertToCentral(Time[0]);
+            TimeSpan currentTime = barTimeCT.TimeOfDay;
+
+            if (currentSessionDate.Date != barTimeCT.Date)
             {
                 cumulativePV = 0;
                 cumulativeVolume = 0;
-                currentSessionDate = Time[0].Date;
+                currentSessionDate = barTimeCT.Date;
 
                 orbHigh = 0;
                 orbLow = 0;
                 orbComplete = false;
+                tradingDisabledForDay = false;
+                barBackfillDone = false; // New trading date — queue a fresh backfill.
 
-                Print("New session reset: " + Time[0].Date);
+                Print("New session reset (CT): " + barTimeCT.Date.ToString("yyyy-MM-dd"));
+
+                // Recover the ORB from history first so orbHigh/orbLow are populated
+                // before BackfillBarsToAPI uses them when building bar payloads.
+                BackfillOrbFromHistory(barTimeCT.Date);
+            }
+
+            // Send today's historical bars to the API once per session.
+            // Fires on the first live bar after a date transition (or on cold start).
+            // BackfillOrbFromHistory runs synchronously above, so orbHigh/orbLow are
+            // ready when BackfillBarsToAPI reads them. Fire-and-forget: bar processing
+            // continues immediately while the HTTP POST runs in the background.
+            if (!barBackfillDone)
+            {
+                barBackfillDone = true;
+                Print("Backfill trigger: starting bar backfill for "
+                    + barTimeCT.Date.ToString("yyyy-MM-dd")
+                    + " | CurrentBar=" + CurrentBar
+                    + " | orbHigh=" + orbHigh + " orbLow=" + orbLow);
+                _ = BackfillBarsToAPI(barTimeCT.Date);
             }
 
             double price = Close[0];
@@ -97,22 +151,31 @@ namespace NinjaTrader.NinjaScript.Strategies
             double rsiValue = RSI(14, 3)[0];
             double avgVolume = SMA(Volume, 20)[0];
 
-            TimeSpan currentTime = Time[0].TimeOfDay;
-
-            if (currentTime >= new TimeSpan(8, 30, 0) && currentTime < new TimeSpan(8, 45, 0))
+            if (currentTime >= OrbWindowStart && currentTime < OrbWindowEnd)
             {
                 orbHigh = orbHigh == 0 ? High[0] : Math.Max(orbHigh, High[0]);
                 orbLow = orbLow == 0 ? Low[0] : Math.Min(orbLow, Low[0]);
             }
 
-            if (currentTime >= new TimeSpan(8, 45, 0))
+            if (currentTime >= OrbWindowEnd && !orbComplete)
+            {
                 orbComplete = true;
+                if (orbHigh <= 0 || orbLow <= 0)
+                {
+                    tradingDisabledForDay = true;
+                    Print("WARNING: ORB window closed without captured bars (started after 08:45 CT?). "
+                        + "Trading disabled for " + barTimeCT.Date.ToString("yyyy-MM-dd"));
+                }
+                else
+                {
+                    Print("ORB locked (CT): high=" + orbHigh + " low=" + orbLow);
+                }
+            }
 
             double safeOrbHigh = orbHigh > 0 ? orbHigh : price;
             double safeOrbLow = orbLow > 0 ? orbLow : price;
 
-            DateTime openTime = new DateTime(Time[0].Year, Time[0].Month, Time[0].Day, 8, 30, 0);
-            int minutesAfterOpen = Math.Max(0, (int)(Time[0] - openTime).TotalMinutes);
+            int minutesAfterOpen = Math.Max(0, (int)(currentTime - OrbWindowStart).TotalMinutes);
 
             double trendScore = 0.0;
 
@@ -136,13 +199,13 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (Math.Abs(SMA(20)[0] - SMA(50)[0]) < atrValue * 0.2)
                 chopScore += 0.3;
 
-            if (Position.MarketPosition != MarketPosition.Flat)
-                await ManageOpenPosition(price, atrValue);
+            if (tradingDisabledForDay)
+                return;
 
             string json = $@"
             {{
                 ""symbol"": ""{Instrument.FullName}"",
-                ""timestamp"": ""{Time[0]:O}"",
+                ""timestamp"": ""{FormatTimestampCT(Time[0])}"",
                 ""open"": {FormatDouble(Open[0])},
                 ""high"": {FormatDouble(High[0])},
                 ""low"": {FormatDouble(Low[0])},
@@ -189,8 +252,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                     return;
                 }
 
+                // Bar data is now recorded. Kick off position management as fire-and-forget
+                // so its HTTP round-trip cannot block the signal-response path on future bars.
                 if (Position.MarketPosition != MarketPosition.Flat)
                 {
+                    _ = ManageOpenPosition(price, atrValue);
                     Print("Signal ignored: already in position.");
                     return;
                 }
@@ -203,6 +269,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
                 string action = ExtractString(result, "action").ToUpperInvariant();
                 string reason = ExtractString(result, "reason");
+                int signalQuantity = ExtractInt(result, "quantity", 1);
 
                 if (string.IsNullOrEmpty(action))
                 {
@@ -223,47 +290,83 @@ namespace NinjaTrader.NinjaScript.Strategies
                     return;
                 }
 
+                double signalEntry = ExtractNullableDouble(result, "entry");
                 double stopLoss = ExtractNullableDouble(result, "stop_loss");
                 double takeProfit = ExtractNullableDouble(result, "take_profit");
 
-                if (stopLoss <= 0 || takeProfit <= 0)
+                if (signalEntry <= 0 || stopLoss <= 0 || takeProfit <= 0)
                 {
-                    Print(action + " blocked: missing stop_loss or take_profit.");
+                    Print(action + " blocked: missing entry, stop_loss, or take_profit.");
                     Print("Reason: " + reason);
                     return;
                 }
 
-                double currentPrice = Close[0];
-
-                Print("ORDER CHECK | Action: " + action
-                    + " | Current: " + currentPrice
-                    + " | Stop: " + stopLoss
-                    + " | Target: " + takeProfit);
-
-                if (!IsValidOrderPrices(action, currentPrice, stopLoss, takeProfit))
+                // Validate the SIGNAL's internal geometry (Python's prices, not market).
+                if (!IsValidSignalGeometry(action, signalEntry, stopLoss, takeProfit))
+                {
+                    Print(action + " blocked: signal geometry invalid (entry=" + signalEntry
+                        + " stop=" + stopLoss + " target=" + takeProfit + ").");
                     return;
+                }
 
-                activeStopLoss = stopLoss;
-                initialStopLoss = stopLoss;
-                activeTakeProfit = takeProfit;
+                // Convert absolute prices into point/tick offsets so they apply at the
+                // *actual fill price*, not the bar close from a minute ago. This is what
+                // fixes "stop_loss above current price" rejections caused by drift during
+                // the async round-trip.
+                double riskPoints = action == "BUY" ? (signalEntry - stopLoss) : (stopLoss - signalEntry);
+                double rewardPoints = action == "BUY" ? (takeProfit - signalEntry) : (signalEntry - takeProfit);
+                int riskTicks = (int)Math.Round(riskPoints / TickSize);
+                int rewardTicks = (int)Math.Round(rewardPoints / TickSize);
+
+                if (riskTicks <= 0 || rewardTicks <= 0)
+                {
+                    Print(action + " blocked: non-positive risk/reward ticks "
+                        + "(risk=" + riskTicks + " reward=" + rewardTicks + ").");
+                    return;
+                }
+
+                // Drift guard: if the live quote moved away from the signal entry while we
+                // were waiting on Python, skip rather than fill far from the planned level.
+                // GetCurrentAsk/GetCurrentBid return the latest tick regardless of bar mode.
+                double liveQuote = action == "BUY" ? GetCurrentAsk(0) : GetCurrentBid(0);
+                if (liveQuote <= 0)
+                    liveQuote = Close[0]; // fall back if level-1 not available
+
+                double drift = Math.Abs(liveQuote - signalEntry);
+                if (drift > MaxSignalDriftPoints)
+                {
+                    Print(action + " skipped: signal entry " + signalEntry
+                        + " drifted " + drift.ToString("0.00") + " pts from live "
+                        + liveQuote + " (max " + MaxSignalDriftPoints + ").");
+                    SendSkipToAPI(action, signalEntry, liveQuote, drift, "drift");
+                    return;
+                }
+
+                Print("ORDER CHECK | " + action + " | live: " + liveQuote
+                    + " | signal entry: " + signalEntry
+                    + " | risk: " + riskPoints + "pt (" + riskTicks + "tk)"
+                    + " | reward: " + rewardPoints + "pt (" + rewardTicks + "tk)");
+
+                pendingRiskPoints = riskPoints;
+                pendingRewardPoints = rewardPoints;
 
                 if (action == "BUY")
                 {
-                    Print("Submitting BUY | Stop: " + activeStopLoss + " | Target: " + activeTakeProfit);
+                    Print("Submitting BUY x" + signalQuantity + " (stops set as ticks-from-entry)");
 
-                    SetStopLoss("AI_LONG", CalculationMode.Price, activeStopLoss, false);
-                    SetProfitTarget("AI_LONG", CalculationMode.Price, activeTakeProfit);
+                    SetStopLoss("AI_LONG", CalculationMode.Ticks, riskTicks, false);
+                    SetProfitTarget("AI_LONG", CalculationMode.Ticks, rewardTicks);
 
-                    EnterLong(1, "AI_LONG");
+                    EnterLong(signalQuantity, "AI_LONG");
                 }
                 else if (action == "SELL")
                 {
-                    Print("Submitting SELL | Stop: " + activeStopLoss + " | Target: " + activeTakeProfit);
+                    Print("Submitting SELL x" + signalQuantity + " (stops set as ticks-from-entry)");
 
-                    SetStopLoss("AI_SHORT", CalculationMode.Price, activeStopLoss, false);
-                    SetProfitTarget("AI_SHORT", CalculationMode.Price, activeTakeProfit);
+                    SetStopLoss("AI_SHORT", CalculationMode.Ticks, riskTicks, false);
+                    SetProfitTarget("AI_SHORT", CalculationMode.Ticks, rewardTicks);
 
-                    EnterShort(1, "AI_SHORT");
+                    EnterShort(signalQuantity, "AI_SHORT");
                 }
             }
             catch (Exception ex)
@@ -306,7 +409,15 @@ namespace NinjaTrader.NinjaScript.Strategies
                 positionSize = quantity;
                 lastAction = "BUY";
 
-                Print("ENTRY FILLED: BUY @ " + entryPrice);
+                // NT placed the stop/target as tick-offsets from this fill. Mirror those
+                // absolute prices locally so ManageOpenPosition / trailing-stop logic
+                // operates against the correct levels.
+                activeStopLoss = entryPrice - pendingRiskPoints;
+                initialStopLoss = activeStopLoss;
+                activeTakeProfit = entryPrice + pendingRewardPoints;
+
+                Print("ENTRY FILLED: BUY @ " + entryPrice
+                    + " | stop=" + activeStopLoss + " | target=" + activeTakeProfit);
                 return;
             }
 
@@ -316,7 +427,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                 positionSize = quantity;
                 lastAction = "SELL";
 
-                Print("ENTRY FILLED: SELL @ " + entryPrice);
+                activeStopLoss = entryPrice + pendingRiskPoints;
+                initialStopLoss = activeStopLoss;
+                activeTakeProfit = entryPrice - pendingRewardPoints;
+
+                Print("ENTRY FILLED: SELL @ " + entryPrice
+                    + " | stop=" + activeStopLoss + " | target=" + activeTakeProfit);
                 return;
             }
 
@@ -344,49 +460,27 @@ namespace NinjaTrader.NinjaScript.Strategies
                 activeStopLoss = 0;
                 activeTakeProfit = 0;
                 initialStopLoss = 0;
+                pendingRiskPoints = 0;
+                pendingRewardPoints = 0;
                 lastManageCall = Core.Globals.MinDate;
             }
         }
 
-        private bool IsValidOrderPrices(string action, double currentPrice, double stopLoss, double takeProfit)
+        private bool IsValidSignalGeometry(string action, double entry, double stopLoss, double takeProfit)
         {
-            if (currentPrice <= 0)
-            {
-                Print("Order blocked: current price is invalid.");
+            // Validates that Python returned a self-consistent signal. Does NOT check
+            // against live market — that's enforced by the tick-offset stops at fill time
+            // and the drift guard before submission.
+            if (entry <= 0 || stopLoss <= 0 || takeProfit <= 0)
                 return false;
-            }
 
             if (action == "BUY")
-            {
-                if (stopLoss >= currentPrice)
-                {
-                    Print("BUY blocked: stop_loss must be below current price.");
-                    return false;
-                }
-
-                if (takeProfit <= currentPrice)
-                {
-                    Print("BUY blocked: take_profit must be above current price.");
-                    return false;
-                }
-            }
+                return stopLoss < entry && takeProfit > entry;
 
             if (action == "SELL")
-            {
-                if (stopLoss <= currentPrice)
-                {
-                    Print("SELL blocked: stop_loss must be above current price.");
-                    return false;
-                }
+                return stopLoss > entry && takeProfit < entry;
 
-                if (takeProfit >= currentPrice)
-                {
-                    Print("SELL blocked: take_profit must be below current price.");
-                    return false;
-                }
-            }
-
-            return true;
+            return false;
         }
 
         private async System.Threading.Tasks.Task ManageOpenPosition(double currentPrice, double atrValue)
@@ -466,6 +560,35 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
         }
 
+        private async void SendSkipToAPI(
+            string action,
+            double signalEntry,
+            double liveQuote,
+            double drift,
+            string reason)
+        {
+            try
+            {
+                string json = $@"
+                {{
+                    ""timestamp"": ""{FormatTimestampCT(Time[0])}"",
+                    ""symbol"": ""{Instrument.FullName}"",
+                    ""action"": ""{action}"",
+                    ""signal_entry"": {FormatDouble(signalEntry)},
+                    ""live_quote"": {FormatDouble(liveQuote)},
+                    ""drift_points"": {FormatDouble(drift)},
+                    ""reason"": ""{reason}""
+                }}";
+
+                var content = new StringContent(json, Encoding.UTF8, "application/json");
+                await client.PostAsync(apiBaseUrl + "/skip", content);
+            }
+            catch (Exception ex)
+            {
+                Print("Skip log API error: " + ex.Message);
+            }
+        }
+
         private async void SendTradeToAPI(
             double entry,
             double exit,
@@ -512,6 +635,12 @@ namespace NinjaTrader.NinjaScript.Strategies
             return match.Success ? match.Groups[1].Value : "";
         }
 
+        private int ExtractInt(string json, string key, int defaultValue)
+        {
+            double raw = ExtractNullableDouble(json, key);
+            return raw > 0 ? (int)raw : defaultValue;
+        }
+
         private double ExtractNullableDouble(string json, string key)
         {
             if (string.IsNullOrWhiteSpace(json) || string.IsNullOrWhiteSpace(key))
@@ -536,6 +665,199 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return "0";
 
             return value.ToString(CultureInfo.InvariantCulture);
+        }
+
+        private static TimeZoneInfo ResolveCentralTimeZone()
+        {
+            try
+            {
+                return TimeZoneInfo.FindSystemTimeZoneById("Central Standard Time");
+            }
+            catch (TimeZoneNotFoundException)
+            {
+                return TimeZoneInfo.FindSystemTimeZoneById("America/Chicago");
+            }
+        }
+
+        private DateTime ConvertToCentral(DateTime t)
+        {
+            // Time[0] in NinjaTrader is typically Unspecified (chart-zone clock).
+            // Treat Unspecified as Local (the chart's zone), then convert to CT.
+            if (t.Kind == DateTimeKind.Utc)
+                return TimeZoneInfo.ConvertTimeFromUtc(t, CentralTimeZone);
+
+            DateTime asLocal = t.Kind == DateTimeKind.Local
+                ? t
+                : DateTime.SpecifyKind(t, DateTimeKind.Local);
+
+            return TimeZoneInfo.ConvertTime(asLocal, TimeZoneInfo.Local, CentralTimeZone);
+        }
+
+        private string FormatTimestampCT(DateTime t)
+        {
+            DateTime ct = ConvertToCentral(t);
+            TimeSpan offset = CentralTimeZone.GetUtcOffset(ct);
+            DateTimeOffset dto = new DateTimeOffset(ct, offset);
+            return dto.ToString("yyyy-MM-ddTHH:mm:ss.fffffffzzz", CultureInfo.InvariantCulture);
+        }
+
+        private async System.Threading.Tasks.Task BackfillBarsToAPI(DateTime sessionDateCT)
+        {
+            // Active trade window: ORB open → ES regular session close.
+            // Pre-market and overnight bars are excluded because they have no ORB context
+            // and would pollute the decision engine's recent_bars window with stale data.
+            TimeSpan activeStart = new TimeSpan(8, 30, 0);   // 08:30 CT — ORB window opens
+            TimeSpan activeEnd   = new TimeSpan(15, 15, 0);  // 15:15 CT — ES regular session close
+
+            // Collect today's active-hour bar indices. Time[0] = current bar, Time[n] = n bars ago,
+            // so this list is ordered newest-first. We reverse it for chronological VWAP accumulation.
+            var indices = new System.Collections.Generic.List<int>();
+            for (int bb = 1; bb <= CurrentBar && bb <= 700; bb++)
+            {
+                DateTime ct = ConvertToCentral(Time[bb]);
+                if (ct.Date < sessionDateCT) break;           // Passed into the previous session — stop.
+                if (ct.Date == sessionDateCT)
+                {
+                    TimeSpan tod = ct.TimeOfDay;
+                    if (tod >= activeStart && tod < activeEnd)
+                        indices.Add(bb);
+                }
+            }
+
+            if (indices.Count == 0)
+            {
+                Print("Backfill: no active-session bars found for " + sessionDateCT.ToString("yyyy-MM-dd")
+                    + " — session may have just opened.");
+                return;
+            }
+
+            // Reverse to chronological (oldest → newest) so VWAP accumulates correctly.
+            indices.Reverse();
+
+            // Recompute session VWAP from the first bar of the day forward.
+            // This mirrors the live cumulativePV / cumulativeVolume logic exactly so
+            // the stored vwap values match what the live feed would have produced.
+            double pv  = 0.0;
+            double vol = 0.0;
+
+            var barJsons = new System.Collections.Generic.List<string>();
+
+            foreach (int bb in indices)
+            {
+                DateTime ct = ConvertToCentral(Time[bb]);
+
+                double typical = (High[bb] + Low[bb] + Close[bb]) / 3.0;
+                pv  += typical * Volume[bb];
+                vol += Volume[bb];
+                double vwap = vol > 0 ? pv / vol : Close[bb];
+
+                double atr    = ATR(14)[bb];
+                double rsi    = RSI(14, 3)[bb];
+                double avgVol = SMA(Volume, 20)[bb];
+
+                // Trend and chop scores — same formula as OnBarUpdate so historical bars
+                // are scored identically to bars the live feed would have produced.
+                double trendScore = 0.0;
+                if (Close[bb] > vwap)              trendScore += 0.3;
+                if (SMA(20)[bb] > SMA(50)[bb])     trendScore += 0.3;
+                if (ADX(14)[bb] > 20)              trendScore += 0.4;
+
+                double chopScore = 0.0;
+                if (ADX(14)[bb] < 18)                                   chopScore += 0.4;
+                if (Math.Abs(Close[bb] - vwap)         < atr * 0.3)    chopScore += 0.3;
+                if (Math.Abs(SMA(20)[bb] - SMA(50)[bb]) < atr * 0.2)   chopScore += 0.3;
+
+                // Use the final backfilled ORB for all bars. Bars inside the ORB window
+                // (minutes_after_open < 15) do not trigger ORB entries anyway, so the
+                // orb_high/orb_low value there is not load-bearing for the signal engine.
+                double orbH = orbHigh > 0 ? orbHigh : Close[bb];
+                double orbL = orbLow  > 0 ? orbLow  : Close[bb];
+
+                int minutesAfterOpen = Math.Max(0, (int)(ct.TimeOfDay - activeStart).TotalMinutes);
+
+                barJsons.Add($@"{{
+                    ""symbol"": ""{Instrument.FullName}"",
+                    ""timestamp"": ""{FormatTimestampCT(Time[bb])}"",
+                    ""open"":  {FormatDouble(Open[bb])},
+                    ""high"":  {FormatDouble(High[bb])},
+                    ""low"":   {FormatDouble(Low[bb])},
+                    ""close"": {FormatDouble(Close[bb])},
+                    ""price"": {FormatDouble(Close[bb])},
+                    ""vwap"":  {FormatDouble(vwap)},
+                    ""atr"":   {FormatDouble(atr)},
+                    ""rsi"":   {FormatDouble(rsi)},
+                    ""orb_high"":   {FormatDouble(orbH)},
+                    ""orb_low"":    {FormatDouble(orbL)},
+                    ""volume"":     {FormatDouble(Volume[bb])},
+                    ""avg_volume"": {FormatDouble(avgVol)},
+                    ""trend_score"": {FormatDouble(trendScore)},
+                    ""chop_score"":  {FormatDouble(chopScore)},
+                    ""position"": ""flat"",
+                    ""minutes_after_open"": {minutesAfterOpen}
+                }}");
+            }
+
+            string json = "[" + string.Join(",\n", barJsons) + "]";
+
+            try
+            {
+                Print("Backfill: sending " + indices.Count + " bars for " + sessionDateCT.ToString("yyyy-MM-dd"));
+                var content  = new StringContent(json, Encoding.UTF8, "application/json");
+                var response = await client.PostAsync(apiBaseUrl + "/backfill", content);
+                var result   = await response.Content.ReadAsStringAsync();
+                Print("Backfill response: " + result);
+            }
+            catch (Exception ex)
+            {
+                Print("Backfill API error: " + ex.Message);
+            }
+        }
+
+        private void BackfillOrbFromHistory(DateTime sessionDateCT)
+        {
+            // Walk back through loaded bars looking for today's 08:30-08:45 CT window.
+            // CurrentBar is the index of the bar in OnBarUpdate; older bars are at higher indices.
+            int scanned = 0;
+            int barsBack = 1; // skip current bar (it's the one being processed)
+
+            while (barsBack <= CurrentBar && scanned < 600)
+            {
+                DateTime candidate = ConvertToCentral(Time[barsBack]);
+
+                if (candidate.Date < sessionDateCT)
+                    break;
+
+                if (candidate.Date == sessionDateCT)
+                {
+                    TimeSpan tod = candidate.TimeOfDay;
+                    if (tod >= OrbWindowStart && tod < OrbWindowEnd)
+                    {
+                        double h = High[barsBack];
+                        double l = Low[barsBack];
+                        orbHigh = orbHigh == 0 ? h : Math.Max(orbHigh, h);
+                        orbLow = orbLow == 0 ? l : Math.Min(orbLow, l);
+                    }
+                }
+
+                barsBack++;
+                scanned++;
+            }
+
+            DateTime currentCT = ConvertToCentral(Time[0]);
+            if (currentCT.TimeOfDay >= OrbWindowEnd)
+            {
+                orbComplete = true;
+                if (orbHigh > 0 && orbLow > 0)
+                {
+                    Print("ORB backfilled from history: high=" + orbHigh + " low=" + orbLow);
+                }
+                else
+                {
+                    tradingDisabledForDay = true;
+                    Print("WARNING: started after 08:45 CT and no ORB bars in history. "
+                        + "Trading disabled for " + sessionDateCT.ToString("yyyy-MM-dd"));
+                }
+            }
         }
     }
 }

@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import sys
 from pathlib import Path
+
+_root = Path(__file__).resolve().parents[2]
+if str(_root) not in sys.path:
+    sys.path.insert(0, str(_root))
+
 from typing import Literal
 
 import joblib
+import lightgbm as lgb
 import pandas as pd
-from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import classification_report
 from sklearn.model_selection import train_test_split
 from sqlalchemy import create_engine
@@ -114,11 +120,13 @@ X_train, X_test, y_train, y_test = train_test_split(
     shuffle=False,
 )
 
-model = RandomForestClassifier(
+model = lgb.LGBMClassifier(
     n_estimators=300,
     max_depth=6,
     random_state=42,
     class_weight="balanced",
+    verbose=-1,
+    n_jobs=-1,
 )
 
 model.fit(X_train, y_train)
@@ -129,4 +137,4 @@ print(classification_report(y_test, preds, zero_division=0))
 
 joblib.dump(model, MODEL_PATH)
 
-print(f"Saved model to {MODEL_PATH}")
+print(f"Saved LightGBM model to {MODEL_PATH}")

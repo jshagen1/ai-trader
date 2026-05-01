@@ -20,7 +20,7 @@ It is designed to:
 ## Core Features
 
 - ORB breakout detection (VWAP + range context)
-- ML probability filter (RandomForest)
+- ML probability filter (LightGBM)
 - Time-of-day performance filtering
 - Dynamic risk sizing per trade
 - Slippage simulation (ES tick-based)
@@ -41,6 +41,10 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
+
+**LightGBM on macOS:** the `pip` wheel links OpenMP. If import fails with `libomp.dylib`, install it (Homebrew: `brew install libomp`), then reinstall or set `DYLD_LIBRARY_PATH` to that lib folder as in the Homebrew caveats.
+
+**Retrain after this change:** existing `app/machine_learning/model.pkl` from RandomForest will not load correctly. From the **repo root**, run: `python3 app/machine_learning/train_model.py` (no `PYTHONPATH` needed; the script adds the project root to `sys.path`).
 
 ### 2. NinjaTrader (Required for data + execution)
 

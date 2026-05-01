@@ -1,18 +1,16 @@
 from __future__ import annotations
 
 from enum import Enum
-from pathlib import Path
 from typing import Any
 
-import joblib
-import pandas as pd
 from sqlalchemy.orm import Session
 
 from app.constants import (
     CHOP_SCORE_MAX,
+    HTF_SLOPE_LOOKBACK,
+    LOSS_STREAK_HALT_THRESHOLD,
+    LOSS_STREAK_REDUCE_QTY_THRESHOLD,
     MINUTES_AFTER_OPEN_ORB_CONTEXT,
-    ML_PROBABILITY_DEFAULT_NO_MODEL,
-    ORB_LONG_ML_THRESHOLD,
     ORB_LONG_RSI_HIGH,
     ORB_LONG_RSI_LOW,
     ORB_LONG_SCORE_THRESHOLD,
@@ -22,7 +20,6 @@ from app.constants import (
     ORB_LONG_WEIGHT_TIME,
     ORB_LONG_WEIGHT_TREND,
     ORB_LONG_WEIGHT_VOLUME,
-    ORB_SHORT_ML_THRESHOLD,
     ORB_SHORT_RSI_HIGH,
     ORB_SHORT_RSI_LOW,
     ORB_SHORT_SCORE_THRESHOLD,
@@ -41,16 +38,20 @@ from app.constants import (
     POSITION_KEY_ENTRY_PRICE,
     POSITION_KEY_INITIAL_STOP,
     POSITION_KEY_STOP_LOSS,
+    ORB_ENTRY_MAX_WICK_ATR,
+    ORB_ENTRY_PROXIMITY_ATR,
+    ORB_RSI_EXHAUSTION_LOOKBACK,
     QUANTITY_MAX_CONTRACTS_DEFAULT,
     QUANTITY_MAX_RISK_DOLLARS_DEFAULT,
     RECENT_BARS_QUERY_LIMIT_DEFAULT,
     SESSION_WEAK_MID_A_END,
     SESSION_WEAK_MID_A_START,
-    SESSION_WEAK_MID_B_END,
-    SESSION_WEAK_MID_B_START,
+    SESSION_ORB_NO_ENTRY_MINUTES_AFTER_OPEN,
     SESSION_WEAK_OPENING_END,
     SESSION_WEAK_OPENING_START,
     STRATEGY_ORB_ATR_MULTIPLIER,
+    STRATEGY_ORB_EARLY_ATR_MULTIPLIER,
+    STRATEGY_ORB_EARLY_SESSION_MINUTES,
     STRATEGY_ORB_REWARD_RISK_RATIO,
     TRAIL_ATR_TIGHTEN_MULTIPLIER,
     TRAIL_LOCK_FRACTION_OF_INITIAL,
@@ -61,21 +62,18 @@ from app.constants import (
     orb_max_risk_points,
 )
 from app.enums import Action, HoldStrategy, PositionStatus, Strategy
-from app.machine_learning.features import build_features
+from app.htf_regime import htf_regime_adaptive
 from app.market_data import bar_dict_from_orm
 from app.market_time import parse_minutes_after_open
 from app.models.trade_signal import TradeSignal
 
 
 class DecisionEngine:
-    def __init__(self) -> None:
-        model_path = Path(__file__).resolve().parent / "machine_learning" / "model.pkl"
-        self.model: Any = joblib.load(model_path) if model_path.exists() else None
-
     def decide(
         self,
         market: Any,
         recent_bars: list[dict[str, Any]] | None = None,
+        loss_streak: int = 0,
     ) -> TradeSignal:
         recent_bars = list(recent_bars or [])
 
@@ -91,6 +89,19 @@ class DecisionEngine:
         if market.position != PositionStatus.FLAT.value:
             return self.hold(HoldStrategy.POSITION_FILTER, "Already in position")
 
+        if loss_streak >= LOSS_STREAK_HALT_THRESHOLD:
+            return self.hold(
+                HoldStrategy.LOSS_STREAK_HALT,
+                f"Halted: {loss_streak} consecutive losses today (>= {LOSS_STREAK_HALT_THRESHOLD})",
+            )
+
+        if minutes_after_open >= SESSION_ORB_NO_ENTRY_MINUTES_AFTER_OPEN:
+            return self.hold(
+                HoldStrategy.TIME_FILTER,
+                f"No ORB entries at or after {SESSION_ORB_NO_ENTRY_MINUTES_AFTER_OPEN} "
+                f"min after open (now {minutes_after_open})",
+            )
+
         if SESSION_WEAK_OPENING_START <= minutes_after_open < SESSION_WEAK_OPENING_END:
             return self.hold(
                 HoldStrategy.TIME_FILTER,
@@ -98,12 +109,6 @@ class DecisionEngine:
             )
 
         if SESSION_WEAK_MID_A_START <= minutes_after_open < SESSION_WEAK_MID_A_END:
-            return self.hold(
-                HoldStrategy.TIME_FILTER,
-                f"Blocked weak mid-session: {minutes_after_open}",
-            )
-
-        if SESSION_WEAK_MID_B_START <= minutes_after_open < SESSION_WEAK_MID_B_END:
             return self.hold(
                 HoldStrategy.TIME_FILTER,
                 f"Blocked weak mid-session: {minutes_after_open}",
@@ -124,13 +129,34 @@ class DecisionEngine:
                 f"Blocked: trend score too weak ({market.trend_score:.2f})",
             )
 
-        return self.orb_breakout(market, minutes_after_open)
+        # Adaptive regime check: uses EMA20 early in the session (30–60 bars) and
+        # graduates to EMA50 once enough history exists (60+ bars). This ensures the
+        # ORB breakout window at 8:45 CT is not blocked solely due to EMA50 cold-start.
+        # See htf_regime.htf_regime_adaptive for the full graduation logic.
+        htf_up, htf_down, _htf_period = htf_regime_adaptive(recent_bars, HTF_SLOPE_LOOKBACK)
 
-    def orb_breakout(self, m: Any, minutes_after_open: int) -> TradeSignal:
-        risk = m.atr * STRATEGY_ORB_ATR_MULTIPLIER
+        return self.orb_breakout(market, minutes_after_open, htf_up, htf_down, loss_streak, recent_bars)
+
+    def orb_breakout(
+        self,
+        m: Any,
+        minutes_after_open: int,
+        htf_up: bool,
+        htf_down: bool,
+        loss_streak: int,
+        recent_bars: list[dict[str, Any]] | None = None,
+    ) -> TradeSignal:
+        # Wider stop for the first 30 min: opening range bars spike further and
+        # a 1.25x ATR stop gets hit before the breakout extends.
+        atr_mult = (
+            STRATEGY_ORB_EARLY_ATR_MULTIPLIER
+            if minutes_after_open < STRATEGY_ORB_EARLY_SESSION_MINUTES
+            else STRATEGY_ORB_ATR_MULTIPLIER
+        )
+        risk = m.atr * atr_mult
 
         max_risk_points = orb_max_risk_points(minutes_after_open)
-        quantity = self.calculate_quantity(risk)
+        quantity = self._sized_quantity(risk, loss_streak)
 
         if risk > max_risk_points:
             return self.hold(
@@ -141,7 +167,39 @@ class DecisionEngine:
         if risk <= 0:
             return self.hold(Strategy.ORB_BREAKOUT, "Invalid ATR")
 
-        ml_prob = self.ml_probability(m)
+        # Require price to be at or above the ORB high (longs) / at or below the
+        # ORB low (shorts). A tiny ATR-based tolerance allows bars that tested the
+        # level intrabar and closed within 1-2 ticks below it (ORB_ENTRY_PROXIMITY_ATR
+        # = 0.15 ≈ half a tick of tolerance at typical ATR). Bars whose close is
+        # clearly inside the range are blocked — they have not broken out.
+        tolerance = m.atr * ORB_ENTRY_PROXIMITY_ATR
+        broke_high = m.price >= m.orb_high - tolerance
+        broke_low = m.price <= m.orb_low + tolerance
+        if not broke_high and not broke_low:
+            return self.hold(
+                HoldStrategy.TREND_FILTER,
+                f"No ORB breakout: price {m.price:.2f} not at ORB level "
+                f"[{m.orb_low:.2f}–{m.orb_high:.2f}] (tolerance {tolerance:.2f})",
+            )
+
+        # RSI exhaustion guard: if RSI was overbought (long) or oversold (short)
+        # within the recent lookback, the move is already exhausted. Re-entry of
+        # RSI into the valid range from an extreme signals fading momentum, not
+        # a fresh breakout.
+        lookback_bars = (recent_bars or [])[-ORB_RSI_EXHAUSTION_LOOKBACK:]
+        recent_rsi = [b["rsi"] for b in lookback_bars if b.get("rsi") is not None]
+        if broke_high and any(r > ORB_LONG_RSI_HIGH for r in recent_rsi):
+            return self.hold(
+                HoldStrategy.TREND_FILTER,
+                f"RSI exhaustion: long RSI was overbought (>{ORB_LONG_RSI_HIGH}) "
+                f"within last {ORB_RSI_EXHAUSTION_LOOKBACK} bars",
+            )
+        if broke_low and any(r < ORB_SHORT_RSI_LOW for r in recent_rsi):
+            return self.hold(
+                HoldStrategy.TREND_FILTER,
+                f"RSI exhaustion: short RSI was oversold (<{ORB_SHORT_RSI_LOW}) "
+                f"within last {ORB_RSI_EXHAUSTION_LOOKBACK} bars",
+            )
 
         long_score = 0.0
         if m.price > m.orb_high:
@@ -171,33 +229,67 @@ class DecisionEngine:
         if m.minutes_after_open >= MINUTES_AFTER_OPEN_ORB_CONTEXT:
             short_score += ORB_SHORT_WEIGHT_TIME
 
-        if long_score >= ORB_LONG_SCORE_THRESHOLD and ml_prob >= ORB_LONG_ML_THRESHOLD:
+        if long_score >= ORB_LONG_SCORE_THRESHOLD:
+            if not (ORB_LONG_RSI_LOW <= m.rsi <= ORB_LONG_RSI_HIGH):
+                return self.hold(
+                    HoldStrategy.TREND_FILTER,
+                    f"Blocked: RSI {m.rsi:.1f} outside long range [{ORB_LONG_RSI_LOW}-{ORB_LONG_RSI_HIGH}]",
+                )
+            if not htf_up:
+                return self.hold(
+                    HoldStrategy.HTF_REGIME_FILTER,
+                    "Blocked long: session EMA not in uptrend",
+                )
+            # Skip entries where the bar already spiked deep into the stop zone:
+            # a large downward wick signals a stop-hunt during the entry candle.
+            wick_below = float(m.close) - float(m.low)
+            if wick_below > m.atr * ORB_ENTRY_MAX_WICK_ATR:
+                return self.hold(
+                    HoldStrategy.RISK_FILTER,
+                    f"ORB long blocked: entry bar wick {wick_below:.2f}pts"
+                    f" > {m.atr * ORB_ENTRY_MAX_WICK_ATR:.2f}pts ({ORB_ENTRY_MAX_WICK_ATR}x ATR)",
+                )
+            live = float(m.price)
             return TradeSignal(
                 action=Action.BUY.value,
                 strategy=Strategy.ORB_BREAKOUT.value,
-                confidence=round((long_score + ml_prob) / 2, 2),
-                reason=(
-                    f"ORB long score {long_score:.2f}, "
-                    f"ML probability {ml_prob:.2f}, qty {quantity}"
-                ),
-                entry=m.price,
-                stop_loss=m.price - risk,
-                take_profit=m.price + risk * STRATEGY_ORB_REWARD_RISK_RATIO,
+                confidence=round(long_score, 2),
+                reason=f"ORB long score {long_score:.2f}, qty {quantity}, loss_streak {loss_streak}",
+                entry=live,
+                stop_loss=live - risk,
+                take_profit=live + risk * STRATEGY_ORB_REWARD_RISK_RATIO,
                 quantity=quantity,
             )
 
-        if short_score >= ORB_SHORT_SCORE_THRESHOLD and ml_prob <= ORB_SHORT_ML_THRESHOLD:
+        if short_score >= ORB_SHORT_SCORE_THRESHOLD:
+            if not (ORB_SHORT_RSI_LOW <= m.rsi <= ORB_SHORT_RSI_HIGH):
+                return self.hold(
+                    HoldStrategy.TREND_FILTER,
+                    f"Blocked: RSI {m.rsi:.1f} outside short range [{ORB_SHORT_RSI_LOW}-{ORB_SHORT_RSI_HIGH}]",
+                )
+            if not htf_down:
+                return self.hold(
+                    HoldStrategy.HTF_REGIME_FILTER,
+                    "Blocked short: session EMA not in downtrend",
+                )
+            # Skip entries where the bar already spiked deep into the stop zone:
+            # a large upward wick signals a stop-hunt during the entry candle.
+            wick_above = float(m.high) - float(m.close)
+            if wick_above > m.atr * ORB_ENTRY_MAX_WICK_ATR:
+                return self.hold(
+                    HoldStrategy.RISK_FILTER,
+                    f"ORB short blocked: entry bar wick {wick_above:.2f}pts"
+                    f" > {m.atr * ORB_ENTRY_MAX_WICK_ATR:.2f}pts ({ORB_ENTRY_MAX_WICK_ATR}x ATR)",
+                )
+            live = float(m.price)
             return TradeSignal(
                 action=Action.SELL.value,
                 strategy=Strategy.ORB_BREAKOUT.value,
-                confidence=round((short_score + (1 - ml_prob)) / 2, 2),
-                reason=(
-                    f"ORB short score {short_score:.2f}, "
-                    f"ML probability {ml_prob:.2f}, qty {quantity}"
-                ),
-                entry=m.price,
-                stop_loss=m.price + risk,
-                take_profit=m.price - risk * STRATEGY_ORB_REWARD_RISK_RATIO,
+                confidence=round(short_score, 2),
+                reason=f"ORB short score {short_score:.2f}, qty {quantity}, loss_streak {loss_streak}",
+                entry=live,
+                stop_loss=live + risk,
+                take_profit=live - risk * STRATEGY_ORB_REWARD_RISK_RATIO,
                 quantity=quantity,
             )
 
@@ -206,38 +298,12 @@ class DecisionEngine:
             strategy=Strategy.ORB_BREAKOUT.value,
             confidence=round(max(long_score, short_score), 2),
             reason=(
-                f"No ORB setup. "
-                f"Long score {long_score:.2f}, "
-                f"Short score {short_score:.2f}, "
-                f"ML probability {ml_prob:.2f}"
+                f"No ORB setup. Long score {long_score:.2f}, Short score {short_score:.2f}"
             ),
             entry=None,
             stop_loss=None,
             take_profit=None,
         )
-
-    def ml_probability(self, market: Any) -> float:
-        if self.model is None:
-            return ML_PROBABILITY_DEFAULT_NO_MODEL
-
-        row = {
-            "open": market.open,
-            "high": market.high,
-            "low": market.low,
-            "close": market.close,
-            "vwap": market.vwap,
-            "orb_high": market.orb_high,
-            "orb_low": market.orb_low,
-            "atr": market.atr,
-            "rsi": market.rsi,
-            "volume": market.volume,
-            "avg_volume": market.avg_volume,
-            "trend_score": market.trend_score,
-            "chop_score": market.chop_score,
-        }
-
-        X = pd.DataFrame([build_features(row)])
-        return float(self.model.predict_proba(X)[0][1])
 
     def get_recent_bars(
         self,
@@ -305,6 +371,12 @@ class DecisionEngine:
             take_profit=None,
             quantity=1,
         )
+
+    def _sized_quantity(self, risk_points: float, loss_streak: int) -> int:
+        base = self.calculate_quantity(risk_points)
+        if loss_streak >= LOSS_STREAK_REDUCE_QTY_THRESHOLD:
+            return 1
+        return base
 
     def calculate_quantity(
         self,

@@ -9,7 +9,6 @@ class Action(str, Enum):
 
 class Strategy(str, Enum):
     ORB_BREAKOUT = "ORB_BREAKOUT"
-    VWAP_REVERSION = "VWAP_REVERSION"
     NONE = "NONE"
 
 
@@ -22,6 +21,9 @@ class HoldStrategy(str, Enum):
     ATR_FILTER = "ATR_FILTER"
     TREND_FILTER = "TREND_FILTER"
     RISK_FILTER = "RISK_FILTER"
+    DESYNC_PROTECTION = "DESYNC_PROTECTION"
+    HTF_REGIME_FILTER = "HTF_REGIME_FILTER"
+    LOSS_STREAK_HALT = "LOSS_STREAK_HALT"
 
 
 class PositionStatus(str, Enum):

@@ -47,6 +47,19 @@ class CompletedTrade(Base):
     slippage_dollars: Mapped[float | None] = mapped_column(Float, nullable=True)
 
 
+class OrderSkip(Base):
+    __tablename__ = "order_skips"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    timestamp: Mapped[str | None] = mapped_column(String, index=True, nullable=True)
+    symbol: Mapped[str | None] = mapped_column(String, nullable=True)
+    action: Mapped[str | None] = mapped_column(String, nullable=True)
+    signal_entry: Mapped[float | None] = mapped_column(Float, nullable=True)
+    live_quote: Mapped[float | None] = mapped_column(Float, nullable=True)
+    drift_points: Mapped[float | None] = mapped_column(Float, nullable=True)
+    reason: Mapped[str | None] = mapped_column(String, nullable=True)
+
+
 class MarketBar(Base):
     __tablename__ = "market_bars"
 
