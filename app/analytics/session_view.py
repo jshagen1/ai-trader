@@ -10,10 +10,12 @@ import pandas as pd
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from app.analytics.session_chart_window import timestamp_in_session_chart_chicago
 from app.constants import (
     BACKTEST_MAX_LOOKAHEAD_BARS,
     BACKTEST_RECENT_BARS_WINDOW,
     BACKTEST_SKIP_BARS_AFTER_TRADE,
+    SESSION_CHART_SESSION_MIN_BARS_THRESHOLD,
 )
 from app.decision_engine import DecisionEngine
 from app.enums import Action, ExitReason
@@ -27,17 +29,21 @@ def list_available_dates(db: Session) -> list[str]:
     """Distinct YYYY-MM-DD dates with a *complete, usable* session, newest first.
 
     A session is considered usable when:
-      - At least 14 of 15 ORB-window bars (08:30-08:44) are present
-      - At least 300 of 391 in-session bars (08:30-15:00) are present
-      - At least 95% of in-session bars have non-null indicators
+      - At least 14 of 15 ORB-window bars (08:30-08:44 Chicago) are present
+      - At least SESSION_CHART_SESSION_MIN_BARS_THRESHOLD bars in 08:30-16:30 Chicago
+      - At least 95% of those in-window bars have non-null indicators
         (vwap, atr, rsi, orb_high, orb_low, trend_score, chop_score)
+
+    Timestamp strings are assumed Chicago wall clock (naive ``YYYY-MM-DD HH:MM:SS``),
+    matching NinjaTrader exports and ``substr(..., 12, 5)`` time extraction.
 
     Filters out empty placeholder dates, holidays, and partial sessions that
     would render a broken/empty chart in the dashboard.
     """
+    thresh = int(SESSION_CHART_SESSION_MIN_BARS_THRESHOLD)
     rows = db.execute(
         text(
-            """
+            f"""
             WITH session_stats AS (
               SELECT
                 substr(timestamp, 1, 10) AS d,
@@ -47,11 +53,11 @@ def list_available_dates(db: Session) -> list[str]:
                     END) AS orb_count,
                 SUM(CASE
                       WHEN substr(timestamp, 12, 5) >= '08:30'
-                       AND substr(timestamp, 12, 5) <= '15:00' THEN 1 ELSE 0
+                       AND substr(timestamp, 12, 5) <= '16:30' THEN 1 ELSE 0
                     END) AS sess_count,
                 SUM(CASE
                       WHEN substr(timestamp, 12, 5) >= '08:30'
-                       AND substr(timestamp, 12, 5) <= '15:00'
+                       AND substr(timestamp, 12, 5) <= '16:30'
                        AND vwap IS NOT NULL AND atr IS NOT NULL
                        AND rsi IS NOT NULL AND orb_high IS NOT NULL
                        AND orb_low IS NOT NULL AND trend_score IS NOT NULL
@@ -64,7 +70,7 @@ def list_available_dates(db: Session) -> list[str]:
             )
             SELECT d FROM session_stats
             WHERE orb_count >= 14
-              AND sess_count >= 300
+              AND sess_count >= {thresh}
               AND clean_count * 100 >= sess_count * 95
             ORDER BY d DESC
             """
@@ -91,7 +97,7 @@ def _bar_to_payload(row: pd.Series) -> dict[str, Any]:
 # - Schema changes: bump _PAYLOAD_SCHEMA_VERSION → all old entries auto-invalidate.
 # - Strategy code changes: cache is in-memory, gone after `uvicorn --reload` / restart.
 _SESSION_CACHE_MAX = 64  # ~6 MB worst case at ~90 KB per entry
-_PAYLOAD_SCHEMA_VERSION = 4  # bumped: added trend_line to session payload
+_PAYLOAD_SCHEMA_VERSION = 5  # bumped: session chart bars clipped to 08:30–16:30 Chicago
 _session_cache: OrderedDict[tuple[str, int], tuple[int, dict[str, Any]]] = OrderedDict()
 _session_cache_lock = Lock()
 _session_cache_hits = 0
@@ -213,6 +219,8 @@ def _compute_session_view(db: Session, date_str: str) -> dict[str, Any]:
             break  # no future bars to simulate exits against
         if i <= skip_until:
             continue
+        if not timestamp_in_session_chart_chicago(bars_all.at[i, "timestamp"]):
+            continue
 
         recent_start = max(0, i - BACKTEST_RECENT_BARS_WINDOW)
         recent_bars = bars_all.iloc[recent_start:i].to_dict("records")
@@ -252,7 +260,9 @@ def _compute_session_view(db: Session, date_str: str) -> dict[str, Any]:
         skip_until = i + BACKTEST_SKIP_BARS_AFTER_TRADE
 
     date_bars = bars_all.iloc[first_idx : last_idx + 1]
-    bars_payload = [_bar_to_payload(row) for _, row in date_bars.iterrows()]
+    chart_mask = date_bars["timestamp"].map(timestamp_in_session_chart_chicago)
+    session_chart_bars = date_bars[chart_mask]
+    bars_payload = [_bar_to_payload(row) for _, row in session_chart_bars.iterrows()]
 
     # ORB is only valid after the 08:30-08:45 window closes (minutes_after_open >= 15).
     # Pre-open / overnight bars have orb_high == orb_low == close as a fallback.

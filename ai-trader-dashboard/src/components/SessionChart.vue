@@ -107,6 +107,28 @@ const THEME = {
   highlight: "#fbbf24",
   highlightFill: "rgba(251, 191, 36, 0.18)",
   trendLine: "rgba(253, 224, 71, 0.55)", // soft yellow — slope shows trend up/down
+  /** Draw order: lower = behind (Chart.js). Candlesticks sit under markers. */
+  zCandles: 0,
+  zTrend: 2,
+  zOrbHigh: 3,
+  zOrbLow: 4,
+  zBuyEntry: 40,
+  zSellEntry: 41,
+  zExitTarget: 55,
+  zExitStop: 56,
+  zExitOther: 57,
+  zSelected: 85,
+  /** Markers: vivid fill + light ring so they read on dark chart / over candles */
+  markerRing: "#ffffff",
+  markerRingWidth: 3,
+  entryBuyFill: "#4ade80",
+  entrySellFill: "#fb7185",
+  exitTargetFill: "#a3e635", // lime — high contrast vs green candles
+  exitTargetBorder: "#365314",
+  exitStopFill: "#f87171",
+  exitStopBorder: "#7f1d1d",
+  exitOtherFill: "#fde047",
+  exitOtherBorder: "#422006",
 };
 
 const fetchDates = async () => {
@@ -231,8 +253,10 @@ function applyDynamicBarThickness(chart) {
 const tradingHourBars = computed(() =>
   bars.value.filter((b) => {
     const m = parseHHMM(b.timestamp);
-    // Show 08:00-15:30 CT window — trims overnight bars that crowd the X axis
-    return m >= 8 * 60 && m <= 15 * 60 + 30;
+    // Match API: 08:30–16:30 America/Chicago (naive timestamps = local chart clock)
+    const open = 8 * 60 + 30;
+    const close = 16 * 60 + 30;
+    return m >= open && m <= close;
   }),
 );
 
@@ -255,9 +279,11 @@ function tsToDate(ts) {
 }
 
 function classifyExit(reason) {
-  if (reason === "TARGET") return { color: "#16a34a", label: "Target" };
-  if (reason === "STOP") return { color: "#dc2626", label: "Stop" };
-  return { color: "#6b7280", label: reason || "Time exit" };
+  if (reason === "TARGET")
+    return { color: THEME.exitTargetFill, label: "Target" };
+  if (reason === "STOP")
+    return { color: THEME.exitStopFill, label: "Stop" };
+  return { color: THEME.exitOtherFill, label: reason || "Time exit" };
 }
 
 function buildDatasets() {
@@ -302,6 +328,7 @@ function buildDatasets() {
     {
       label: "Bars",
       type: "candlestick",
+      order: THEME.zCandles,
       data: candles,
       backgroundColors: {
         up: THEME.green,
@@ -320,6 +347,7 @@ function buildDatasets() {
     datasets.push({
       label: "Trend",
       type: "line",
+      order: THEME.zTrend,
       data: trendLine.value.map((p) => ({
         x: tsToDate(p.timestamp).valueOf(),
         y: p.value,
@@ -343,6 +371,7 @@ function buildDatasets() {
         {
           label: `ORB high (${orb.value.high})`,
           type: "line",
+          order: THEME.zOrbHigh,
           data: [
             { x: xMin, y: orb.value.high },
             { x: xMax, y: orb.value.high },
@@ -356,6 +385,7 @@ function buildDatasets() {
         {
           label: `ORB low (${orb.value.low})`,
           type: "line",
+          order: THEME.zOrbLow,
           data: [
             { x: xMin, y: orb.value.low },
             { x: xMax, y: orb.value.low },
@@ -370,67 +400,81 @@ function buildDatasets() {
     }
   }
 
+  const markerScatterBase = {
+    type: "scatter",
+    borderWidth: THEME.markerRingWidth,
+    borderColor: THEME.markerRing,
+    hoverBorderWidth: THEME.markerRingWidth + 1,
+    hoverBorderColor: "#ffffff",
+  };
+
   if (buyEntries.length) {
     datasets.push({
+      ...markerScatterBase,
       label: "BUY entry",
-      type: "scatter",
+      order: THEME.zBuyEntry,
       data: buyEntries,
       pointStyle: "triangle",
-      pointRadius: 9,
-      pointHoverRadius: 12,
-      backgroundColor: "rgba(22, 163, 74, 0.95)",
-      borderColor: "#14532d",
+      pointRadius: 12,
+      pointHoverRadius: 16,
+      backgroundColor: THEME.entryBuyFill,
     });
   }
 
   if (sellEntries.length) {
     datasets.push({
+      ...markerScatterBase,
       label: "SELL entry",
-      type: "scatter",
+      order: THEME.zSellEntry,
       data: sellEntries,
       pointStyle: "triangle",
       rotation: 180,
-      pointRadius: 9,
-      pointHoverRadius: 12,
-      backgroundColor: "rgba(220, 38, 38, 0.95)",
-      borderColor: "#7f1d1d",
+      pointRadius: 12,
+      pointHoverRadius: 16,
+      backgroundColor: THEME.entrySellFill,
     });
   }
 
   if (exitsTarget.length) {
     datasets.push({
+      ...markerScatterBase,
       label: "Exit (target)",
-      type: "scatter",
+      order: THEME.zExitTarget,
       data: exitsTarget,
-      pointStyle: "crossRot",
-      pointRadius: 10,
-      pointHoverRadius: 13,
-      borderColor: "#16a34a",
-      backgroundColor: "#16a34a",
+      pointStyle: "circle",
+      pointRadius: 11,
+      pointHoverRadius: 15,
+      backgroundColor: THEME.exitTargetFill,
+      borderColor: THEME.markerRing,
+      borderWidth: THEME.markerRingWidth,
     });
   }
   if (exitsStop.length) {
     datasets.push({
+      ...markerScatterBase,
       label: "Exit (stop)",
-      type: "scatter",
+      order: THEME.zExitStop,
       data: exitsStop,
-      pointStyle: "crossRot",
-      pointRadius: 10,
-      pointHoverRadius: 13,
-      borderColor: "#dc2626",
-      backgroundColor: "#dc2626",
+      pointStyle: "circle",
+      pointRadius: 11,
+      pointHoverRadius: 15,
+      backgroundColor: THEME.exitStopFill,
+      borderColor: THEME.markerRing,
+      borderWidth: THEME.markerRingWidth,
     });
   }
   if (exitsOther.length) {
     datasets.push({
+      ...markerScatterBase,
       label: "Exit (time)",
-      type: "scatter",
+      order: THEME.zExitOther,
       data: exitsOther,
-      pointStyle: "crossRot",
+      pointStyle: "rectRot",
       pointRadius: 10,
-      pointHoverRadius: 13,
-      borderColor: "#9ca3af",
-      backgroundColor: "#9ca3af",
+      pointHoverRadius: 14,
+      backgroundColor: THEME.exitOtherFill,
+      borderColor: THEME.exitOtherBorder,
+      borderWidth: 2,
     });
   }
 
@@ -441,6 +485,7 @@ function buildDatasets() {
       datasets.push({
         label: "Selected",
         type: "scatter",
+        order: THEME.zSelected,
         data: [
           {
             x: tsToDate(d.entry_time).valueOf(),
@@ -449,11 +494,11 @@ function buildDatasets() {
           },
         ],
         pointStyle: "circle",
-        pointRadius: 14,
-        pointHoverRadius: 16,
+        pointRadius: 18,
+        pointHoverRadius: 22,
         borderColor: THEME.highlight,
-        backgroundColor: THEME.highlightFill,
-        borderWidth: 3,
+        backgroundColor: "rgba(251, 191, 36, 0.35)",
+        borderWidth: 4,
       });
     }
   }

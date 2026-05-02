@@ -19,6 +19,11 @@ HEALTH_STATUS_OK = "ok"
 # --- Live bridge / ES: block orders if payload fields disagree beyond this (index points) ---
 DESYNC_PRICE_GUARD_MAX_POINTS = 3.0
 
+# --- Dashboard session chart (America/Chicago = CST/CDT) ---
+# Bars returned by /dashboard/sessions/{date} are clipped to 08:30–16:30 local.
+SESSION_CHART_TIMEZONE = "America/Chicago"
+SESSION_CHART_SESSION_MIN_BARS_THRESHOLD = 360  # list_available_dates (~75% of full 1m RTH day)
+
 # --- Position / bridge payloads ---
 POSITION_ACTION_UPDATE_STOP = "UPDATE_STOP"
 MANAGE_POSITION_RESPONSE_NEW_STOP = "new_stop_loss"

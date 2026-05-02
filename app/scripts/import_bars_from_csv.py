@@ -61,13 +61,13 @@ before_rth = len(df)
 
 df = df[
     (df["timestamp"].dt.time >= time(8, 30)) &
-    (df["timestamp"].dt.time <= time(15, 0))
+    (df["timestamp"].dt.time <= time(16, 30))
 ].copy()
 
 print(f"RTH rows kept: {len(df)}/{before_rth}")
 
 if df.empty:
-    print("No RTH rows found after filtering 08:30–15:00.")
+    print("No RTH rows found after filtering 08:30–16:30 (Chicago).")
     print("Nothing imported.")
     sys.exit(0)
 
