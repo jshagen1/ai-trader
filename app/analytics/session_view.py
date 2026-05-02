@@ -23,16 +23,50 @@ from app.slippage import apply_entry_slippage, apply_exit_slippage
 
 
 def list_available_dates(db: Session) -> list[str]:
-    """Distinct YYYY-MM-DD dates with at least one market bar, newest first.
+    """Distinct YYYY-MM-DD dates with a *complete, usable* session, newest first.
 
-    Works for both `2026-04-30T...` and `2026-04-30 ...` timestamp prefixes;
-    the substr(1,10) takes the date portion either way.
+    A session is considered usable when:
+      - At least 14 of 15 ORB-window bars (08:30-08:44) are present
+      - At least 300 of 391 in-session bars (08:30-15:00) are present
+      - At least 95% of in-session bars have non-null indicators
+        (vwap, atr, rsi, orb_high, orb_low, trend_score, chop_score)
+
+    Filters out empty placeholder dates, holidays, and partial sessions that
+    would render a broken/empty chart in the dashboard.
     """
     rows = db.execute(
         text(
-            "SELECT DISTINCT substr(timestamp, 1, 10) AS d "
-            "FROM market_bars WHERE timestamp IS NOT NULL "
-            "ORDER BY d DESC"
+            """
+            WITH session_stats AS (
+              SELECT
+                substr(timestamp, 1, 10) AS d,
+                SUM(CASE
+                      WHEN substr(timestamp, 12, 5) >= '08:30'
+                       AND substr(timestamp, 12, 5) <= '08:44' THEN 1 ELSE 0
+                    END) AS orb_count,
+                SUM(CASE
+                      WHEN substr(timestamp, 12, 5) >= '08:30'
+                       AND substr(timestamp, 12, 5) <= '15:00' THEN 1 ELSE 0
+                    END) AS sess_count,
+                SUM(CASE
+                      WHEN substr(timestamp, 12, 5) >= '08:30'
+                       AND substr(timestamp, 12, 5) <= '15:00'
+                       AND vwap IS NOT NULL AND atr IS NOT NULL
+                       AND rsi IS NOT NULL AND orb_high IS NOT NULL
+                       AND orb_low IS NOT NULL AND trend_score IS NOT NULL
+                       AND chop_score IS NOT NULL
+                      THEN 1 ELSE 0
+                    END) AS clean_count
+              FROM market_bars
+              WHERE timestamp IS NOT NULL
+              GROUP BY d
+            )
+            SELECT d FROM session_stats
+            WHERE orb_count >= 14
+              AND sess_count >= 300
+              AND clean_count * 100 >= sess_count * 95
+            ORDER BY d DESC
+            """
         )
     ).fetchall()
     return [r[0] for r in rows if r[0]]
