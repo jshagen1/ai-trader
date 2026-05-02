@@ -4,6 +4,12 @@ The fitted value at each bar is the y-value the regression line takes at that
 bar's position in its own trailing window. Plotted as a connected line, the
 result is a smoothed price curve whose slope visualizes the prevailing short-
 term trend (rising = uptrend, falling = downtrend, flat = chop).
+
+Used for the dashboard visualization only. Slope and extension filters were
+tested as strategy gates and rejected on the current 15-day uptrending dataset
+— see CLAUDE.md "What we tried that doesn't work". Revisit when the dataset
+includes downtrend / chop sessions; X=1.0 extension cap on W=30 is the most
+defensible candidate to retry.
 """
 
 from __future__ import annotations

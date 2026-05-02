@@ -16,6 +16,7 @@ from app.constants import (
     BACKTEST_MAX_LOOKAHEAD_BARS,
     BACKTEST_RECENT_BARS_WINDOW,
     BACKTEST_SKIP_BARS_AFTER_TRADE,
+    EXIT_ADVERSE_CLOSE_STREAK,
     POINT_VALUE,
 )
 from app.decision_engine import DecisionEngine
@@ -104,18 +105,30 @@ def simulate_exit(
 
     future = bars.iloc[entry_index + 1 : entry_index + 1 + BACKTEST_MAX_LOOKAHEAD_BARS]
 
+    is_buy = action == Action.BUY.value
+    adverse_streak = 0
+
     for _, row in future.iterrows():
-        if action == Action.BUY.value:
+        if is_buy:
             if row["low"] <= stop:
                 return stop, ExitReason.STOP.value, row["timestamp"]
             if row["high"] >= target:
                 return target, ExitReason.TARGET.value, row["timestamp"]
-
-        if action == Action.SELL.value:
+        else:
             if row["high"] >= stop:
                 return stop, ExitReason.STOP.value, row["timestamp"]
             if row["low"] <= target:
                 return target, ExitReason.TARGET.value, row["timestamp"]
+
+        # Adverse-close streak: exit if N consecutive bars close against direction.
+        # Constant + rationale: app/constants.py EXIT_ADVERSE_CLOSE_STREAK.
+        went_against = (row["close"] < row["open"]) if is_buy else (row["close"] > row["open"])
+        if went_against:
+            adverse_streak += 1
+            if adverse_streak >= EXIT_ADVERSE_CLOSE_STREAK:
+                return row["close"], ExitReason.ADVERSE_CLOSE.value, row["timestamp"]
+        else:
+            adverse_streak = 0
 
     if len(future) == 0:
         return entry, ExitReason.NO_DATA.value, None

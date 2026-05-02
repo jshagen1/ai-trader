@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 
 from app.constants import (
     CHOP_SCORE_MAX,
+    EXIT_ADVERSE_CLOSE_STREAK,
     HTF_SLOPE_LOOKBACK,
     LOSS_STREAK_HALT_THRESHOLD,
     LOSS_STREAK_REDUCE_QTY_THRESHOLD,
@@ -391,3 +392,31 @@ class DecisionEngine:
 
         quantity = int(max_risk_dollars / (risk_points * point_value))
         return max(1, min(quantity, max_contracts))
+
+
+def should_exit_adverse_close(
+    action: str,
+    bars_after_entry: list[dict[str, Any]],
+    streak: int = EXIT_ADVERSE_CLOSE_STREAK,
+) -> bool:
+    """True when the most recent `streak` bars all closed against the position
+    direction (close < open for BUY, close > open for SELL).
+
+    Used as a momentum-reversal exit: a long that's seen 3 reds in a row has
+    almost certainly given up its move, so cut at the current close rather than
+    riding to the full stop. Backtest evidence and rationale documented at
+    EXIT_ADVERSE_CLOSE_STREAK in app/constants.py.
+    """
+    if streak <= 0 or len(bars_after_entry) < streak:
+        return False
+    recent = bars_after_entry[-streak:]
+    is_buy = action == Action.BUY.value
+    for bar in recent:
+        o = bar.get("open")
+        c = bar.get("close")
+        if o is None or c is None:
+            return False
+        went_against = (c < o) if is_buy else (c > o)
+        if not went_against:
+            return False
+    return True

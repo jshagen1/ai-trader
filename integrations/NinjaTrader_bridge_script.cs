@@ -1,5 +1,6 @@
 #region Using declarations
 using System;
+using System.Collections.Generic;
 using System.Net.Http;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -56,6 +57,15 @@ namespace NinjaTrader.NinjaScript.Strategies
         // If the live quote drifts more than this from the signal entry between bar close
         // and order submission, skip the trade rather than fill at a far-off price.
         private const double MaxSignalDriftPoints = 3.0;
+
+        // Bars observed since the open of the current position. Sent to the server's
+        // /manage-position endpoint so the adverse-close exit rule (3 consecutive bars
+        // closing against position direction) can fire before the full stop is hit.
+        // Capped at BarsSinceEntryCap; the rule only needs the last 3.
+        // See app/constants.py EXIT_ADVERSE_CLOSE_STREAK and CLAUDE.md for evidence.
+        private List<double> barsSinceEntryOpens = new List<double>();
+        private List<double> barsSinceEntryCloses = new List<double>();
+        private const int BarsSinceEntryCap = 30;
 
         protected override void OnStateChange()
         {
@@ -134,6 +144,20 @@ namespace NinjaTrader.NinjaScript.Strategies
                     + " | CurrentBar=" + CurrentBar
                     + " | orbHigh=" + orbHigh + " orbLow=" + orbLow);
                 _ = BackfillBarsToAPI(barTimeCT.Date);
+            }
+
+            // Track this just-closed bar for the adverse-close exit rule. Only
+            // accumulates while a position is open; the entry fill empties the list
+            // so only post-entry bars are counted. Capped to keep the JSON small.
+            if (Position.MarketPosition != MarketPosition.Flat)
+            {
+                barsSinceEntryOpens.Add(Open[0]);
+                barsSinceEntryCloses.Add(Close[0]);
+                while (barsSinceEntryOpens.Count > BarsSinceEntryCap)
+                {
+                    barsSinceEntryOpens.RemoveAt(0);
+                    barsSinceEntryCloses.RemoveAt(0);
+                }
             }
 
             double price = Close[0];
@@ -416,6 +440,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                 initialStopLoss = activeStopLoss;
                 activeTakeProfit = entryPrice + pendingRewardPoints;
 
+                // Reset bars-since-entry tracking; the next OnBarUpdate (bar after
+                // entry fill) will be the first one appended.
+                barsSinceEntryOpens.Clear();
+                barsSinceEntryCloses.Clear();
+
                 Print("ENTRY FILLED: BUY @ " + entryPrice
                     + " | stop=" + activeStopLoss + " | target=" + activeTakeProfit);
                 return;
@@ -430,6 +459,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                 activeStopLoss = entryPrice + pendingRiskPoints;
                 initialStopLoss = activeStopLoss;
                 activeTakeProfit = entryPrice - pendingRewardPoints;
+
+                barsSinceEntryOpens.Clear();
+                barsSinceEntryCloses.Clear();
 
                 Print("ENTRY FILLED: SELL @ " + entryPrice
                     + " | stop=" + activeStopLoss + " | target=" + activeTakeProfit);
@@ -451,6 +483,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                 Print("EXIT FILLED via " + orderName + " @ " + exitPrice + " | PnL: " + pnl);
 
                 SendTradeToAPI(entryPrice, exitPrice, pnl, lastAction, positionSize, time);
+
+                // Position is closed — drop any in-flight bars-since-entry tracking.
+                barsSinceEntryOpens.Clear();
+                barsSinceEntryCloses.Clear();
 
                 positionSize = 0;
                 entryPrice = 0;
@@ -483,6 +519,26 @@ namespace NinjaTrader.NinjaScript.Strategies
             return false;
         }
 
+        private string BuildBarsSinceEntryJson()
+        {
+            int n = barsSinceEntryOpens.Count;
+            if (n == 0)
+                return "[]";
+
+            var sb = new StringBuilder("[");
+            for (int i = 0; i < n; i++)
+            {
+                if (i > 0) sb.Append(",");
+                sb.Append("{\"open\":");
+                sb.Append(FormatDouble(barsSinceEntryOpens[i]));
+                sb.Append(",\"close\":");
+                sb.Append(FormatDouble(barsSinceEntryCloses[i]));
+                sb.Append("}");
+            }
+            sb.Append("]");
+            return sb.ToString();
+        }
+
         private async System.Threading.Tasks.Task ManageOpenPosition(double currentPrice, double atrValue)
         {
             if ((DateTime.Now - lastManageCall).TotalSeconds < 5)
@@ -495,6 +551,8 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             string action = Position.MarketPosition == MarketPosition.Long ? "BUY" : "SELL";
 
+            string barsJson = BuildBarsSinceEntryJson();
+
             string json = $@"
             {{
                 ""symbol"": ""{Instrument.FullName}"",
@@ -504,7 +562,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 ""stop_loss"": {FormatDouble(activeStopLoss)},
                 ""initial_stop"": {FormatDouble(initialStopLoss)},
                 ""take_profit"": {FormatDouble(activeTakeProfit)},
-                ""atr"": {FormatDouble(atrValue)}
+                ""atr"": {FormatDouble(atrValue)},
+                ""bars_since_entry"": {barsJson}
             }}";
 
             try
@@ -513,6 +572,16 @@ namespace NinjaTrader.NinjaScript.Strategies
                 var response = await client.PostAsync(apiBaseUrl + "/manage-position", content);
                 var result = await response.Content.ReadAsStringAsync();
 
+                // Compact debug line for verifying the adverse-close path on Replay/Sim:
+                // shows how many bars-since-entry were sent and what action came back.
+                // Look for "ManagePos: bars=N -> EXIT_POSITION (ADVERSE_CLOSE)" to confirm
+                // the rule fired; "bars=N -> UPDATE_STOP" is the normal trailing-stop path.
+                string debugAction = string.IsNullOrEmpty(result) ? "(empty)"
+                    : ExtractString(result, "action");
+                string debugReason = ExtractString(result, "reason");
+                Print("ManagePos: bars=" + barsSinceEntryOpens.Count
+                    + " -> " + debugAction
+                    + (string.IsNullOrEmpty(debugReason) ? "" : " (" + debugReason + ")"));
                 Print("Manage response: " + result);
 
                 if (string.IsNullOrWhiteSpace(result))
@@ -528,6 +597,22 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
 
                 string updateAction = ExtractString(result, "action").ToUpperInvariant();
+
+                // Adverse-close exit: server says flatten now (3 consecutive bars
+                // closed against direction). Submit market exit and bail out before
+                // touching the stop.
+                if (updateAction == "EXIT_POSITION")
+                {
+                    string exitReason = ExtractString(result, "reason");
+                    Print("Adverse-close exit triggered: " + exitReason);
+                    int qty = Position.Quantity;
+                    if (Position.MarketPosition == MarketPosition.Long)
+                        ExitLong(qty, "AI_LONG_EXIT_ADVERSE", "AI_LONG");
+                    else if (Position.MarketPosition == MarketPosition.Short)
+                        ExitShort(qty, "AI_SHORT_EXIT_ADVERSE", "AI_SHORT");
+                    return;
+                }
+
                 double newStopLoss = ExtractNullableDouble(result, "new_stop_loss");
 
                 if (updateAction != "UPDATE_STOP" || newStopLoss <= 0)

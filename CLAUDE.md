@@ -87,10 +87,76 @@ Current `trades.db` contains complete data for **2026-04-13 → 2026-05-01 (15 d
 | Symmetric `trend_score` (unlocks shorts) | 72t, 49% WR, **+42.64 PnL** (−42.55) | Unlocks shorts but they lose money; sign-direction gate also costs longs |
 | MQL5 article retest pattern (Break → Retest → Re-Break) layered on filters | 2t, **−1.22 PnL** | Almost never fires |
 | Retest pattern with minimal filters | 84-86t, 40-43% WR, **−22 to −36 PnL** | Pattern itself loses money on this data |
+| Trend-line slope filter (BUY needs slope ≥ X, mirror for SELL; W=30 OLS) | best at X=−0.05: +88.30 (Δ +2.32, noise); X=0.0: +82.49 | Slope distribution at entry is essentially identical for winners and losers (BUY wins median +0.088, losses +0.105). No usable signal. |
+| Trend-line extension cap (reject if `(close − fitted)/ATR > X`) | best at W=30, X=1.0: +86.13 (Δ **+0.14**); all other windows (10/20/50) and thresholds regress −4 to −37 | Winners do enter closer to the line (median +0.006 vs losers +0.296 ATR) but distributions overlap too much. Theoretically defensible (mean-reversion guard) but the +0.14 improvement is statistical noise on this 15-day uptrend-only dataset. **Re-test when downtrend / chop sessions are added; X=1.0 with W=30 is the candidate to revisit.** |
 
 The recurring lesson: **on this 15-day dataset, opening more gates produces a strict regression**. The current filter stack is near a local optimum for this data; further gains require either more data or different ideas (not just looser filters).
 
-## What did improve the strategy this session
+## What did improve the dashboard (not strategy) this session
+
+[app/trend_lines.py](app/trend_lines.py): rolling 30-bar OLS fitted-value at each
+bar, exposed via the session view payload (`trend_line: [{timestamp, value}, …]`)
+and rendered as a soft-yellow line in [SessionChart.vue](ai-trader-dashboard/src/components/SessionChart.vue).
+Visualization only — was tested as a strategy gate (slope and extension filters
+across windows 10/20/30/50, thresholds X = 0.1 → 2.0) and rejected, see the
+"What we tried that doesn't work" table.
+
+## What did improve the strategy this session (exits)
+
+**Adverse-close momentum-reversal exit** ([app/constants.py](app/constants.py)
+`EXIT_ADVERSE_CLOSE_STREAK = 3`):
+
+Exit at the close of the bar when 3 consecutive bars have closed against the
+position direction (close < open for a BUY, close > open for a SELL). The new
+[`should_exit_adverse_close`](app/decision_engine.py) helper is wired into
+[simulate_exit](app/scripts/backtest_from_bars.py) (so backtests reflect it)
+and into [/manage-position](app/main.py) (live bridge can opt in by sending
+`bars_since_entry` with the position payload).
+
+Backtest on 2026-04 dataset (78 trades):
+- **PnL +85.99 → +105.00 (Δ +19.01, +22%)**
+- **Wins 43 → 46 (WR 55% → 59%)**
+- **Profit factor 1.86 → 2.19**
+- Exit-reason mix: STOPs 32→25, TARGETs 37→37 unchanged, TIME_EXITs 9→6, plus 10 new ADVERSE_CLOSE
+- Per-day: **6 days improved, 7 unchanged, 0 regressed**. The wins came from BUY trades that had run up briefly, then 3 reds in a row signaled momentum reversal — exiting at the 3rd close locked in some profit instead of riding to the full stop.
+
+Bridge integration ([integrations/NinjaTrader_bridge_script.cs](integrations/NinjaTrader_bridge_script.cs)):
+the bridge maintains two `List<double>` fields (`barsSinceEntryOpens`,
+`barsSinceEntryCloses`, capped at 30 entries) that:
+- Reset to empty when an entry order fills (`AI_LONG`/`AI_SHORT` execution).
+- Append `Open[0]`/`Close[0]` of each just-closed bar in `OnBarUpdate` while the
+  position is non-flat.
+- Are sent to `/manage-position` as `bars_since_entry` JSON array.
+- Are cleared again when an exit fill arrives.
+
+When the server response is `{"action": "EXIT_POSITION", "reason": "ADVERSE_CLOSE"}`,
+the bridge submits `ExitLong(qty, "AI_LONG_EXIT_ADVERSE", "AI_LONG")` (or the
+short mirror) to flatten the position via market order. Standard exit-fill
+handling then computes PnL and logs the trade.
+
+**Sim/Replay verification log line** ([NinjaTrader_bridge_script.cs](integrations/NinjaTrader_bridge_script.cs)
+in `ManageOpenPosition`):
+
+```
+ManagePos: bars=N -> ACTION (REASON)
+```
+
+Each `/manage-position` call prints one of these to the NT output window:
+- `ManagePos: bars=2 -> UPDATE_STOP` — normal trailing-stop path, only 2 bars
+  since entry so the rule can't fire yet (needs 3 consecutive against-direction
+  closes).
+- `ManagePos: bars=5 -> UPDATE_STOP` — 5 bars sent, server decided to keep the
+  position open (most recent 3 bars were not all adverse).
+- `ManagePos: bars=4 -> EXIT_POSITION (ADVERSE_CLOSE)` — rule fired. Bridge will
+  immediately follow with `Adverse-close exit triggered: ADVERSE_CLOSE` and an
+  `EXIT FILLED via AI_LONG_EXIT_ADVERSE @ <price>` line once the market exit
+  fills.
+
+Use this to verify on NT Replay before going live: enter a trade in a chop
+session, watch the bar count climb, and confirm the rule fires on a real
+3-red-candle reversal.
+
+## What did improve the dashboard (not strategy) this session
 
 These are already shipped:
 

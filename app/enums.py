@@ -35,3 +35,4 @@ class ExitReason(str, Enum):
     TARGET = "TARGET"
     TIME_EXIT = "TIME_EXIT"
     NO_DATA = "NO_DATA"
+    ADVERSE_CLOSE = "ADVERSE_CLOSE"

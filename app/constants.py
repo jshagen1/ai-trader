@@ -109,6 +109,14 @@ ORB_SHORT_RSI_HIGH = 45
 
 ORB_RISK_BASE_MAX_POINTS = 7.5
 
+# Adverse-close exit: when N consecutive bars close against an open position's
+# direction (red bars on a long, green bars on a short), exit at the close of
+# the Nth bar instead of waiting for the stop. Backtest on the 2026-04 dataset
+# (78 trades) showed +19.01 PnL improvement (+85.99 → +105.00, 6 days improved,
+# 0 regressed). Theory: 3 consecutive against-direction closes signal momentum
+# reversal — exit while still ahead instead of riding to the full stop.
+EXIT_ADVERSE_CLOSE_STREAK = 3
+
 # --- Position sizing (ORB) ---
 QUANTITY_MAX_RISK_DOLLARS_DEFAULT = 100.0
 QUANTITY_MAX_CONTRACTS_DEFAULT = 3

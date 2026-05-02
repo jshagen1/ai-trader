@@ -23,7 +23,7 @@ from app.constants import (
     POSITION_ACTION_UPDATE_STOP,
     RECENT_BARS_QUERY_LIMIT_DEFAULT,
 )
-from app.decision_engine import DecisionEngine
+from app.decision_engine import DecisionEngine, should_exit_adverse_close
 from app.db.database import Base
 from app.db.database import SessionLocal
 from app.db.database import engine
@@ -143,8 +143,20 @@ def get_signal(market: MarketState) -> TradeSignal:
 
 @app.post("/manage-position")
 def manage_position(position: dict[str, Any]) -> dict[str, Any]:
-    new_stop = decision_engine.adjust_trailing_stop(position)
+    # Adverse-close momentum-reversal exit: if the bridge supplies the bars
+    # observed since entry under "bars_since_entry", check the rule. When 3
+    # consecutive bars have closed against the position, return an exit
+    # instruction instead of a trailing-stop update so the bridge can flatten
+    # at the current close before the full stop is hit. See EXIT_ADVERSE_CLOSE_STREAK
+    # in app/constants.py for the backtest evidence.
+    bars_since_entry = position.get("bars_since_entry") or []
+    if bars_since_entry and should_exit_adverse_close(
+        position.get("action", ""),
+        bars_since_entry,
+    ):
+        return {"action": "EXIT_POSITION", "reason": "ADVERSE_CLOSE"}
 
+    new_stop = decision_engine.adjust_trailing_stop(position)
     return {
         "action": POSITION_ACTION_UPDATE_STOP,
         MANAGE_POSITION_RESPONSE_NEW_STOP: new_stop,
