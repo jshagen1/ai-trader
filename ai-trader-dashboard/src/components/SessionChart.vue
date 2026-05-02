@@ -56,6 +56,7 @@ const selectedDate = ref(null);
 const bars = ref([]);
 const decisions = ref([]);
 const orb = ref(null);
+const trendLine = ref([]);
 const loading = ref(false);
 const error = ref(null);
 const selectedIndex = ref(null);
@@ -105,6 +106,7 @@ const THEME = {
   orbLow: "rgba(239, 68, 68, 0.9)",
   highlight: "#fbbf24",
   highlightFill: "rgba(251, 191, 36, 0.18)",
+  trendLine: "rgba(253, 224, 71, 0.55)", // soft yellow — slope shows trend up/down
 };
 
 const fetchDates = async () => {
@@ -147,6 +149,7 @@ const fetchSession = async (date, { silent = false } = {}) => {
     bars.value = res.data.bars ?? [];
     decisions.value = res.data.decisions ?? [];
     orb.value = res.data.orb ?? null;
+    trendLine.value = res.data.trend_line ?? [];
     lastUpdated.value = new Date();
     if (silent) {
       updateChartData();
@@ -312,6 +315,25 @@ function buildDatasets() {
       },
     },
   ];
+
+  if (trendLine.value && trendLine.value.length) {
+    datasets.push({
+      label: "Trend",
+      type: "line",
+      data: trendLine.value.map((p) => ({
+        x: tsToDate(p.timestamp).valueOf(),
+        y: p.value,
+      })),
+      borderColor: THEME.trendLine,
+      backgroundColor: THEME.trendLine,
+      borderWidth: 2,
+      pointRadius: 0,
+      pointHoverRadius: 0,
+      fill: false,
+      tension: 0.2,
+      spanGaps: true,
+    });
+  }
 
   if (orb.value) {
     const xMin = candles.length ? candles[0].x : null;

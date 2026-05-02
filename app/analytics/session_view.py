@@ -20,6 +20,7 @@ from app.enums import Action, ExitReason
 from app.pnl import calculate_pnl
 from app.scripts.backtest_from_bars import simulate_exit, to_market_state
 from app.slippage import apply_entry_slippage, apply_exit_slippage
+from app.trend_lines import compute_trend_line
 
 
 def list_available_dates(db: Session) -> list[str]:
@@ -90,7 +91,7 @@ def _bar_to_payload(row: pd.Series) -> dict[str, Any]:
 # - Schema changes: bump _PAYLOAD_SCHEMA_VERSION → all old entries auto-invalidate.
 # - Strategy code changes: cache is in-memory, gone after `uvicorn --reload` / restart.
 _SESSION_CACHE_MAX = 64  # ~6 MB worst case at ~90 KB per entry
-_PAYLOAD_SCHEMA_VERSION = 3  # bumped: ORDER BY timestamp (was id) to fix backfill ordering
+_PAYLOAD_SCHEMA_VERSION = 4  # bumped: added trend_line to session payload
 _session_cache: OrderedDict[tuple[str, int], tuple[int, dict[str, Any]]] = OrderedDict()
 _session_cache_lock = Lock()
 _session_cache_hits = 0
@@ -163,7 +164,7 @@ def session_view(db: Session, date_str: str) -> dict[str, Any]:
     """
     latest_id = _latest_bar_id_for_date(db, date_str)
     if latest_id is None:
-        return {"date": date_str, "bars": [], "decisions": [], "orb": None}
+        return {"date": date_str, "bars": [], "decisions": [], "orb": None, "trend_line": []}
 
     cached = _cache_get(date_str, latest_id)
     if cached is not None:
@@ -184,7 +185,7 @@ def _compute_session_view(db: Session, date_str: str) -> dict[str, Any]:
         db.bind,
     )
     if bars_all.empty:
-        return {"date": date_str, "bars": [], "decisions": [], "orb": None}
+        return {"date": date_str, "bars": [], "decisions": [], "orb": None, "trend_line": []}
 
     bars_all = bars_all.dropna(
         subset=[
@@ -196,7 +197,7 @@ def _compute_session_view(db: Session, date_str: str) -> dict[str, Any]:
 
     in_date = bars_all["timestamp"].astype(str).str.startswith(date_str)
     if not in_date.any():
-        return {"date": date_str, "bars": [], "decisions": [], "orb": None}
+        return {"date": date_str, "bars": [], "decisions": [], "orb": None, "trend_line": []}
 
     date_indices = bars_all.index[in_date].tolist()
     first_idx = date_indices[0]
@@ -272,4 +273,5 @@ def _compute_session_view(db: Session, date_str: str) -> dict[str, Any]:
         "bars": bars_payload,
         "decisions": decisions,
         "orb": orb_payload,
+        "trend_line": compute_trend_line(bars_payload),
     }
